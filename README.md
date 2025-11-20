@@ -3,9 +3,8 @@ Final project will contain a UI for making system of prompting
 Start with making CLI to create a simple system. Must define expected input and output. Then define how many LLM passes to make, and create templates for each pass. Harder part might be structured output.
 If a sub prompt is something like
 Given X, Tell us Y and Z. Then Y and Z are used independantly in other prompts.
-Different possibilities: depending on the response of a subprompt, we may want to trigger different flows. 
-
-
+Different possibilities: depending on the response of a subprompt, we may want to trigger different flows.   
+Overall, the input and output will behave like a current chatbot, but the underlying system will consist of multiple llm prompts and flows depending on outputs that will eventually reach a more accurate response.
 
 User can:
 - "+" add nodes in a graph
@@ -22,7 +21,7 @@ Nodes are in some way just an automatic prompting of an llm (currently api only)
 
 
 Testing:
-Depending on the systems goals we can write tests, and even test individual nodes within a system.   
+Depending on the systems goals we can write tests, and even test individual nodes within a system. Actually, tests should be encorporated as an important part of the project. Its easy and useless to design a simple prompt system framework, but its much more useful to easily design and test it.   
 Chess example:
 
 
