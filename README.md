@@ -7,8 +7,32 @@ Different possibilities: depending on the response of a subprompt, we may want t
 
 
 
+User can:
+- "+" add nodes in a graph
+- "-" remove nodes from a graph
+- Inspect and edit templates for nodes
+- When adding a node, must decide where the input comes from, and where the output goes
+- Removing node must deal with the same issues
+- There must be an overall input and an overall output of the entire system
+- 
+
+What is a node in the graph?
+Node is a instruction + prompt for an llm. It has some input, either absolute input or from another node. This input is assembled into a prompt along with instructions. The prompt assembly is decided by some template.
+Nodes are in some way just an automatic prompting of an llm (currently api only) where the inputs are either user provided (at start of system) or automatically passed from a previous node.
+
+
+Testing:
+Depending on the systems goals we can write tests, and even test individual nodes within a system.   
+Chess example:
+
+
+- give a chess move
+- Is this a valid move
+- Depending on answer if no, circle back to start with provided context.
+
+We can test the "is this a valid move" part independently by passing moves that we know are valid or not.
+
 Create some examples:
 - Simple agent example?
 - Chess example
-- Agent normalizer example
 - Advanced social media example
