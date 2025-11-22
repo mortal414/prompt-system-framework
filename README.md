@@ -40,6 +40,14 @@ Config-first framework for authoring and running systems of prompts – graphs o
      --input examples/input/move_validator/legal_opening_knight.json
    ```
    Swap the input file with any other JSON in `examples/input/move_validator/` (legal or illegal) to observe how the validator reacts.
+6. **Benchmark the validator over every labeled scenario**
+   ```bash
+   psf benchmark \
+     --system systems/move_validator_system.yaml \
+     --inputs-dir examples/input/move_validator \
+     --iterations 20
+   ```
+   Use `--input` repeatedly to target a subset (e.g., just the late-endgame cases) while keeping the iteration count.
 
 ## Move validator samples
 
@@ -52,6 +60,23 @@ Config-first framework for authoring and running systems of prompts – graphs o
 - `illegal_middlegame_queen_capture.json` – premature `Qxf7#` when own pawn still blocks the queen’s diagonal.  
 - `illegal_endgame_king_into_check.json` – king tries to step onto d3 while a black rook on d4 covers the square.
 
+## Benchmark automation
+
+Run structured accuracy sweeps on any labeled system by comparing an expected input label with a specific final output field.
+
+```bash
+psf benchmark \
+  --system systems/move_validator_system.yaml \
+  --inputs-dir examples/input/move_validator \
+  --iterations 20 \
+  --expect-field expected_legality \
+  --output-field is_legal
+```
+
+- `--inputs-dir` scans a directory for JSON/YAML inputs (use `--input` repeatedly to target individual files).  
+- `--iterations` controls how many times each scenario is executed, which is handy for spotting stochastic model errors.  
+- The command prints per-scenario accuracy plus detailed mismatch logs and exits non-zero when any scenario fails.
+
 ## CLI overview
 
 | Command | Description |
@@ -59,6 +84,7 @@ Config-first framework for authoring and running systems of prompts – graphs o
 | `psf run --system <path> --input <path>` | Execute a system with structured input, log artifacts, and print the final mapped output. Add `--stdin` to pipe JSON or `--dry-run` to only validate config+input. |
 | `psf validate --system <path>` | Schema + wiring validation (node IDs, bindings, routing, loop targets, system input/output definition). |
 | `psf inspect --system <path>` | Textual graph inspection listing providers, models, routing edges, and loop metadata. |
+| `psf benchmark --system <path> --inputs-dir <dir>` | Re-run labeled scenarios multiple times, compare expected vs actual outputs, and summarize accuracy. |
 | `psf replay --run <run.json or dir>` | Re-run a stored snapshot (`system.yaml` + `input.json`) and capture a fresh run in the current runs directory. |
 
 ## Project layout
