@@ -1,0 +1,98 @@
+id: "move_validator_simple_system"
+label: "Chess Move Validator (Single Pass)"
+version: "0.1.0"
+entry_node_id: "quick_legality_check"
+
+provider_defaults:
+  openai:
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 256
+
+system_input:
+  fields:
+    position_fen:
+      type: string
+      required: true
+      description: "Board state in Forsyth–Edwards Notation"
+    candidate_move:
+      type: string
+      required: true
+      description: "Move to validate (SAN or long algebraic)"
+    move_context:
+      type: string
+      required: false
+      description: "Optional intent or commentary"
+
+system_output:
+  fields:
+    is_legal:
+      from: "node.format_legality.output.is_legal"
+    reason:
+      from: "node.format_legality.output.reason"
+    confidence:
+      from: "node.format_legality.output.confidence"
+    message:
+      from: "node.format_legality.output.message"
+
+nodes:
+  - id: "quick_legality_check"
+    label: "Single-pass legality question"
+    instructions: |
+      You are a concise chess arbiter answering whether a single move is legal.
+      Respond with plain text in two short sentences: first sentence must be either "Legal" or "Illegal" followed by a colon and justification; second sentence should name any rules that apply.
+    prompt_template: |
+      Position (FEN): {{ position_fen }}
+      Candidate move: {{ candidate_move }}
+      {% if move_context %}Context: {{ move_context }}{% endif %}
+
+      Is this move legal under classical chess rules? Be crisp.
+    input_bindings:
+      position_fen:
+        from: "system.position_fen"
+      candidate_move:
+        from: "system.candidate_move"
+      move_context:
+        from: "system.move_context"
+        required: false
+    output_mode: "raw"
+    routing:
+      on_success:
+        - next: "format_legality"
+
+  - id: "format_legality"
+    label: "Format quick decision"
+    instructions: |
+      Turn the raw text into structured JSON.
+      If the first sentence begins with "Legal", set is_legal=true.
+      If it begins with "Illegal", set is_legal=false.
+      Confidence should be 0.8 when the answer sounds decisive, otherwise 0.5.
+      Include a short friendly message summarizing the verdict.
+    prompt_template: |
+      Raw response:
+      {{ quick_text }}
+
+      Respond with compact JSON:
+      {
+        "is_legal": true|false,
+        "reason": "<one short sentence>",
+        "confidence": <number between 0 and 1>,
+        "message": "<user-facing summary>"
+      }
+    input_bindings:
+      quick_text:
+        from: "node.quick_legality_check.raw_output"
+    output_mode: "structured"
+    output_schema:
+      type: object
+      properties:
+        is_legal:
+          type: boolean
+        reason:
+          type: string
+        confidence:
+          type: number
+        message:
+          type: string
+      required: [is_legal, reason, message]
+    terminal: true

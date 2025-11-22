@@ -1,0 +1,333 @@
+id: "move_validator_consensus_system"
+label: "Chess Move Validator (Dual-Path Consensus)"
+version: "0.1.0"
+entry_node_id: "normalize_input"
+
+provider_defaults:
+  openai:
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 640
+
+system_input:
+  fields:
+    position_fen:
+      type: string
+      required: true
+      description: "Board state in Forsyth–Edwards Notation"
+    candidate_move:
+      type: string
+      required: true
+      description: "Move to validate (SAN or long algebraic)"
+    move_context:
+      type: string
+      required: false
+      description: "Optional intent or commentary"
+
+system_output:
+  fields:
+    is_legal:
+      from: "node.final_response.output.is_legal"
+    reason:
+      from: "node.final_response.output.reason"
+    confidence:
+      from: "node.final_response.output.confidence"
+    message:
+      from: "node.final_response.output.message"
+    disagreement_count:
+      from: "node.final_response.output.disagreement_count"
+
+nodes:
+  - id: "normalize_input"
+    label: "Normalize board context"
+    instructions: |
+      Translate the incoming system input into a normalized JSON summary that downstream nodes can reuse.
+      Focus on: side to move, king safety notes, loose pieces, pawn structure, and any immediate tactical motifs.
+    prompt_template: |
+      Position (FEN): {{ position_fen }}
+      Candidate move: {{ candidate_move }}
+      {% if move_context %}Context: {{ move_context }}{% endif %}
+
+      Respond with JSON:
+      {
+        "fen": "<original fen>",
+        "side_to_move": "white|black",
+        "key_features": ["...", "..."],
+        "king_safety": "<short note>",
+        "pressure_points": ["...", "..."]
+      }
+    input_bindings:
+      position_fen:
+        from: "system.position_fen"
+      candidate_move:
+        from: "system.candidate_move"
+      move_context:
+        from: "system.move_context"
+        required: false
+    output_mode: "structured"
+    output_schema:
+      type: object
+      properties:
+        fen:
+          type: string
+        side_to_move:
+          type: string
+        key_features:
+          type: array
+          items:
+            type: string
+        king_safety:
+          type: string
+        pressure_points:
+          type: array
+          items:
+            type: string
+      required: [fen, side_to_move]
+    routing:
+      on_success:
+        - next: "path_alpha_validation"
+
+  - id: "path_alpha_validation"
+    label: "Path Alpha – classical reasoning"
+    instructions: |
+      You are Path Alpha, a classical chess arbiter.
+      Use algebraic-chess terminology, highlight pins/pawns, and keep tone formal.
+      Respect any disagreement context provided; treat it as feedback from earlier attempts.
+    prompt_template: |
+      Normalized snapshot (dict):
+      {{ normalized_state }}
+
+      Candidate move: {{ candidate_move }}
+      {% if move_context %}User context: {{ move_context }}{% endif %}
+      {% if disagreement_context %}Prior disagreements to address: {{ disagreement_context }}{% endif %}
+
+      Decide if the move is legal. Respond with JSON:
+      {
+        "is_legal": true|false,
+        "reason": "<short classical explanation>",
+        "evidence": ["<fact1>", "<fact2>"],
+        "confidence": <number 0-1>
+      }
+    input_bindings:
+      normalized_state:
+        from: "node.normalize_input.output"
+      candidate_move:
+        from: "system.candidate_move"
+      move_context:
+        from: "system.move_context"
+        required: false
+      disagreement_context:
+        from: "node.handle_disagreement.output.feedback"
+        required: false
+    output_mode: "structured"
+    output_schema:
+      type: object
+      properties:
+        is_legal:
+          type: boolean
+        reason:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: string
+        confidence:
+          type: number
+      required: [is_legal, reason]
+    routing:
+      on_success:
+        - next: "path_bravo_validation"
+
+  - id: "path_bravo_validation"
+    label: "Path Bravo – spatial reasoning"
+    instructions: |
+      You are Path Bravo, a spatial chess analyst describing geometry, squares, and attack rays in natural language.
+      Use the normalized snapshot plus any disagreement context to double-check Path Alpha.
+    prompt_template: |
+      Normalized snapshot (dict):
+      {{ normalized_state }}
+
+      Move under review: {{ candidate_move }}
+      {% if move_context %}Intent: {{ move_context }}{% endif %}
+      {% if disagreement_context %}Feedback from earlier disagreement: {{ disagreement_context }}{% endif %}
+
+      Respond with JSON:
+      {
+        "is_legal": true|false,
+        "reason": "<geometric explanation>",
+        "critical_squares": ["e4", "f7"],
+        "confidence": <number 0-1>
+      }
+    input_bindings:
+      normalized_state:
+        from: "node.normalize_input.output"
+      candidate_move:
+        from: "system.candidate_move"
+      move_context:
+        from: "system.move_context"
+        required: false
+      disagreement_context:
+        from: "node.handle_disagreement.output.feedback"
+        required: false
+    output_mode: "structured"
+    output_schema:
+      type: object
+      properties:
+        is_legal:
+          type: boolean
+        reason:
+          type: string
+        critical_squares:
+          type: array
+          items:
+            type: string
+        confidence:
+          type: number
+      required: [is_legal, reason]
+    routing:
+      on_success:
+        - next: "compare_paths"
+
+  - id: "compare_paths"
+    label: "Compare path verdicts"
+    instructions: |
+      Compare Path Alpha and Path Bravo outputs.
+      They agree only if both is_legal flags match.
+      When they agree, choose the higher-confidence reason as the final rationale.
+      When they disagree, provide a short note explaining the difference.
+    prompt_template: |
+      Path Alpha result:
+      {{ alpha_result }}
+
+      Path Bravo result:
+      {{ bravo_result }}
+
+      Respond with JSON:
+      {
+        "agree": true|false,
+        "final_is_legal": true|false,
+        "reason": "<selected or blended explanation>",
+        "notes": "<only when disagree>"
+      }
+      Rules:
+      - final_is_legal must equal both path verdicts when agree=true.
+      - When agree=false, final_is_legal should mirror Path Alpha's verdict (used only for logging).
+    input_bindings:
+      alpha_result:
+        from: "node.path_alpha_validation.output"
+      bravo_result:
+        from: "node.path_bravo_validation.output"
+    output_mode: "structured"
+    output_schema:
+      type: object
+      properties:
+        agree:
+          type: boolean
+        final_is_legal:
+          type: boolean
+        reason:
+          type: string
+        notes:
+          type: string
+      required: [agree, final_is_legal, reason]
+    routing:
+      on_success:
+        - condition: "output.agree == true"
+          next: "final_response"
+        - condition: "output.agree == false"
+          next: "handle_disagreement"
+
+  - id: "handle_disagreement"
+    label: "Disagreement handler"
+    instructions: |
+      Summarize how Path Alpha and Path Bravo differed.
+      Produce feedback that can be fed back into both paths, encouraging them to reconcile.
+      Keep track of how many disagreements have occurred.
+    prompt_template: |
+      Path Alpha view: {{ alpha_view }}
+      Path Bravo view: {{ bravo_view }}
+      Notes: {{ notes | default("n/a") }}
+      Attempts so far: {{ attempts }}
+
+      Respond with JSON:
+      {
+        "feedback": "<guidance to address next iteration>",
+        "summary": "<one-line mismatch recap>"
+      }
+    input_bindings:
+      alpha_view:
+        from: "node.path_alpha_validation.output"
+      bravo_view:
+        from: "node.path_bravo_validation.output"
+      notes:
+        from: "node.compare_paths.output.notes"
+        required: false
+      attempts:
+        from: "runtime.loop_counters.consensus_retry"
+        required: false
+        default: 0
+    output_mode: "structured"
+    output_schema:
+      type: object
+      properties:
+        feedback:
+          type: string
+        summary:
+          type: string
+      required: [feedback]
+    loop_control:
+      counter_key: "consensus_retry"
+      max_iterations: 3
+      loop_target_node: "path_alpha_validation"
+      exit_on_success: false
+    routing:
+      on_success:
+        - next: "path_alpha_validation"
+      on_loop_exhausted:
+        - next: "final_response"
+
+  - id: "final_response"
+    label: "Finalize consensus verdict"
+    instructions: |
+      Produce the final answer for the user.
+      If agreement was reached, celebrate the consensus and cite the blended reason.
+      If the consensus loop was exhausted, mark the move as "unknown/illegal" and explain the disagreement history.
+    prompt_template: |
+      Agreement achieved: {{ agree | default(false) }}
+      Final is_legal from comparer: {{ final_is_legal | default(false) }}
+      Selected reason: {{ compare_reason | default("(none)") }}
+      Disagreement summary: {{ disagreement_summary | default("(none)") }}
+      Total disagreements: {{ disagreement_count | default(0) }}
+    input_bindings:
+      agree:
+        from: "node.compare_paths.output.agree"
+        required: false
+      final_is_legal:
+        from: "node.compare_paths.output.final_is_legal"
+        required: false
+      compare_reason:
+        from: "node.compare_paths.output.reason"
+        required: false
+      disagreement_summary:
+        from: "node.handle_disagreement.output.summary"
+        required: false
+      disagreement_count:
+        from: "runtime.loop_counters.consensus_retry"
+        required: false
+        default: 0
+    output_mode: "structured"
+    output_schema:
+      type: object
+      properties:
+        is_legal:
+          type: boolean
+        reason:
+          type: string
+        confidence:
+          type: number
+        message:
+          type: string
+        disagreement_count:
+          type: integer
+      required: [reason, message]
+    terminal: true
