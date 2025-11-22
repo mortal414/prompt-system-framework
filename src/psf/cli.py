@@ -63,6 +63,22 @@ class BenchmarkResult:
         return [record for record in self.iterations if record.status != "success"]
 
 
+@dataclass
+class SystemBenchmarkSummary:
+    system_id: str
+    system_label: Optional[str]
+    system_version: Optional[str]
+    system_path: Path
+    benchmark_root: Path
+    summary_path: Path
+    scenario_results: List[BenchmarkResult]
+
+    @property
+    def overall_accuracy(self) -> float:
+        total_runs = sum(result.total_runs for result in self.scenario_results)
+        total_successes = sum(result.successes for result in self.scenario_results)
+        return (total_successes / total_runs) if total_runs else 0.0
+
 def _resolve_path(path: str | Path) -> Path:
     p = Path(path).expanduser().resolve()
     if not p.exists():
@@ -133,7 +149,7 @@ def run(
 
 @app.command()
 def benchmark(
-    system: str = typer.Option(..., "--system", help="Path to system definition"),
+    systems: List[str] = typer.Option(..., "--system", "-s", help="Path to system definition (repeat for multiple systems)"),
     inputs_dir: Optional[str] = typer.Option(None, "--inputs-dir", help="Directory containing benchmark input files"),
     input: Optional[List[str]] = typer.Option(None, "--input", "-i", help="Specific input file (repeatable)"),
     iterations: int = typer.Option(5, "--iterations", min=1, help="Number of runs per scenario"),
@@ -141,49 +157,48 @@ def benchmark(
     output_field: str = typer.Option("is_legal", "--output-field", help="System output field to compare"),
     run_dir: str = typer.Option(DEFAULT_RUN_DIR, "--run-dir", help="Directory to store per-iteration artifacts"),
 ) -> None:
-    """Run multiple labeled inputs repeatedly, logging each run and reporting accuracy statistics."""
-    system_path = _resolve_path(system)
-    system_def = _load_system_cli(system_path)
+    """Run multiple labeled inputs repeatedly across one or more systems and report accuracy statistics."""
+    if not systems:
+        raise typer.BadParameter("At least one --system argument is required.")
     scenario_paths = _collect_scenario_paths(inputs_dir, input)
     if not scenario_paths:
         raise typer.BadParameter("No benchmark inputs provided. Use --inputs-dir and/or --input.")
     scenarios = _load_benchmark_scenarios(scenario_paths, expect_field)
-    engine = ExecutionEngine(system_def)
     run_root = Path(run_dir).expanduser().resolve()
     run_root.mkdir(parents=True, exist_ok=True)
     benchmark_id = _generate_benchmark_id()
-    benchmark_root = run_root / system_def.id / "benchmarks" / benchmark_id
-    benchmark_root.mkdir(parents=True, exist_ok=False)
-    started_at = datetime.now(timezone.utc)
-    results: list[BenchmarkResult] = []
-    for scenario in scenarios:
-        result = _run_benchmark_for_scenario(
-            engine=engine,
-            system=system_def,
-            scenario=scenario,
+    suite_root = run_root / "benchmarks" / benchmark_id
+    suite_root.mkdir(parents=True, exist_ok=False)
+    system_summaries: list[SystemBenchmarkSummary] = []
+    for system_arg in systems:
+        system_path = _resolve_path(system_arg)
+        system_def = _load_system_cli(system_path)
+        typer.echo(f"\n=== Benchmarking system: {system_def.id} ({system_def.label or 'unnamed'}) ===")
+        summary = _run_benchmark_for_system(
+            system_def=system_def,
+            system_path=system_path,
+            scenarios=scenarios,
             iterations=iterations,
             output_field=output_field,
-            benchmark_root=benchmark_root,
+            run_root=run_root,
             benchmark_id=benchmark_id,
-            system_path=system_path,
+            expect_field=expect_field,
         )
-        results.append(result)
-    finished_at = datetime.now(timezone.utc)
-    summary_path = benchmark_root / "benchmark_summary.json"
-    _write_benchmark_summary(
-        summary_path=summary_path,
-        system=system_def,
+        system_summaries.append(summary)
+        _print_benchmark_summary(summary.scenario_results, summary.summary_path)
+        typer.echo(f"Artifacts stored under: {summary.benchmark_root}")
+    suite_summary_path = suite_root / "suite_summary.json"
+    _write_suite_summary(
+        suite_summary_path,
         benchmark_id=benchmark_id,
-        results=results,
-        started_at=started_at,
-        finished_at=finished_at,
+        system_summaries=system_summaries,
         expect_field=expect_field,
         output_field=output_field,
         iterations_per_scenario=iterations,
     )
-    _print_benchmark_summary(results, summary_path)
-    typer.echo(f"Benchmark artifacts stored under: {benchmark_root}")
-    if any(result.failures for result in results):
+    _print_system_comparison_table(system_summaries, suite_summary_path)
+    any_failures = any(result.failures for summary in system_summaries for result in summary.scenario_results)
+    if any_failures:
         raise typer.Exit(code=1)
 
 
@@ -409,6 +424,58 @@ def _run_benchmark_for_scenario(
     )
 
 
+def _run_benchmark_for_system(
+    *,
+    system_def: SystemDef,
+    system_path: Path,
+    scenarios: List[BenchmarkScenario],
+    iterations: int,
+    output_field: str,
+    run_root: Path,
+    benchmark_id: str,
+    expect_field: str,
+) -> SystemBenchmarkSummary:
+    engine = ExecutionEngine(system_def)
+    benchmark_root = run_root / system_def.id / "benchmarks" / benchmark_id
+    benchmark_root.mkdir(parents=True, exist_ok=False)
+    started_at = datetime.now(timezone.utc)
+    scenario_results: list[BenchmarkResult] = []
+    for scenario in scenarios:
+        result = _run_benchmark_for_scenario(
+            engine=engine,
+            system=system_def,
+            scenario=scenario,
+            iterations=iterations,
+            output_field=output_field,
+            benchmark_root=benchmark_root,
+            benchmark_id=benchmark_id,
+            system_path=system_path,
+        )
+        scenario_results.append(result)
+    finished_at = datetime.now(timezone.utc)
+    summary_path = benchmark_root / "benchmark_summary.json"
+    _write_benchmark_summary(
+        summary_path=summary_path,
+        system=system_def,
+        benchmark_id=benchmark_id,
+        results=scenario_results,
+        started_at=started_at,
+        finished_at=finished_at,
+        expect_field=expect_field,
+        output_field=output_field,
+        iterations_per_scenario=iterations,
+    )
+    return SystemBenchmarkSummary(
+        system_id=system_def.id,
+        system_label=system_def.label,
+        system_version=system_def.version,
+        system_path=system_path,
+        benchmark_root=benchmark_root,
+        summary_path=summary_path,
+        scenario_results=scenario_results,
+    )
+
+
 def _print_benchmark_summary(results: list[BenchmarkResult], summary_path: Optional[Path] = None) -> None:
     if not results:
         typer.echo("No benchmark scenarios executed.")
@@ -441,6 +508,47 @@ def _print_benchmark_summary(results: list[BenchmarkResult], summary_path: Optio
                 )
     if summary_path:
         typer.echo(f"\nBenchmark summary saved to: {summary_path}")
+
+
+def _print_system_comparison_table(system_summaries: List[SystemBenchmarkSummary], suite_summary_path: Path) -> None:
+    if not system_summaries:
+        typer.echo("No systems benchmarked.")
+        return
+    if len(system_summaries) == 1:
+        typer.echo(f"\nSuite summary saved to: {suite_summary_path}")
+        return
+    reference_results = system_summaries[0].scenario_results
+    label_width = max(12, max(len(summary.system_label or summary.system_id) for summary in system_summaries))
+    typer.echo("\nCross-system comparison")
+    header = f"{'Scenario':35} {'Expected':>9}"
+    for summary in system_summaries:
+        label = (summary.system_label or summary.system_id)[:label_width]
+        header += f" {label:>{label_width}}"
+    typer.echo(header)
+    typer.echo("-" * len(header))
+    for reference_result in reference_results:
+        scenario_name = reference_result.scenario.name
+        expected_label = reference_result.scenario.expected_label
+        row = f"{scenario_name:35} {expected_label:>9}"
+        for summary in system_summaries:
+            scenario_result = _get_scenario_result(summary, scenario_name)
+            accuracy = (scenario_result.successes / scenario_result.total_runs) * 100 if scenario_result.total_runs else 0.0
+            row += f" {accuracy:>{label_width - 1}.1f}%"
+        typer.echo(row)
+    typer.echo("-" * len(header))
+    overall_row = f"{'Overall':35} {'-':>9}"
+    for summary in system_summaries:
+        overall_pct = summary.overall_accuracy * 100
+        overall_row += f" {overall_pct:>{label_width - 1}.1f}%"
+    typer.echo(overall_row)
+    typer.echo(f"\nSuite summary saved to: {suite_summary_path}")
+
+
+def _get_scenario_result(summary: SystemBenchmarkSummary, scenario_name: str) -> BenchmarkResult:
+    for result in summary.scenario_results:
+        if result.scenario.name == scenario_name:
+            return result
+    raise RuntimeError(f"Scenario '{scenario_name}' not found in results for system '{summary.system_id}'")
 
 
 def _coerce_bool(value: Any) -> bool:
@@ -524,6 +632,64 @@ def _write_benchmark_summary(
         summary["scenarios"].append(scenario_entry)
     with summary_path.open("w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2, ensure_ascii=False)
+
+
+def _write_suite_summary(
+    summary_path: Path,
+    *,
+    benchmark_id: str,
+    system_summaries: List[SystemBenchmarkSummary],
+    expect_field: str,
+    output_field: str,
+    iterations_per_scenario: int,
+) -> None:
+    data: dict[str, Any] = {
+        "benchmark_id": benchmark_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "system_count": len(system_summaries),
+        "expect_field": expect_field,
+        "output_field": output_field,
+        "iterations_per_scenario": iterations_per_scenario,
+        "systems": [],
+        "scenarios": [],
+    }
+    for summary in system_summaries:
+        data["systems"].append(
+            {
+                "system_id": summary.system_id,
+                "system_label": summary.system_label,
+                "system_version": summary.system_version,
+                "system_path": str(summary.system_path),
+                "benchmark_root": str(summary.benchmark_root),
+                "summary_path": str(summary.summary_path),
+                "overall_accuracy": summary.overall_accuracy,
+            }
+        )
+    if system_summaries:
+        reference_results = system_summaries[0].scenario_results
+        for reference in reference_results:
+            scenario_entry = {
+                "name": reference.scenario.name,
+                "path": str(reference.scenario.path),
+                "expected_label": reference.scenario.expected_label,
+                "systems": [],
+            }
+            for summary in system_summaries:
+                scenario_result = _get_scenario_result(summary, reference.scenario.name)
+                accuracy = (scenario_result.successes / scenario_result.total_runs) if scenario_result.total_runs else 0.0
+                scenario_entry["systems"].append(
+                    {
+                        "system_id": summary.system_id,
+                        "system_label": summary.system_label,
+                        "accuracy": accuracy,
+                        "successes": scenario_result.successes,
+                        "failures": scenario_result.failures,
+                        "total_runs": scenario_result.total_runs,
+                    }
+                )
+            data["scenarios"].append(scenario_entry)
+    with summary_path.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -40,14 +40,15 @@ Config-first framework for authoring and running systems of prompts – graphs o
      --input examples/input/move_validator/legal_opening_knight.json
    ```
    Swap the input file with any other JSON in `examples/input/move_validator/` (legal or illegal) to observe how the validator reacts.
-6. **Benchmark the validator over every labeled scenario**
+6. **Benchmark the validator over every labeled scenario (optionally across multiple systems)**
    ```bash
    psf benchmark \
      --system systems/move_validator_system.yaml \
+     --system systems/move_validator_single_pass.yaml \
      --inputs-dir examples/input/move_validator \
      --iterations 20
    ```
-   Use `--input` repeatedly to target a subset (e.g., just the late-endgame cases) while keeping the iteration count. Every iteration is logged like a normal `psf run`, and both the per-run artifacts _and_ the consolidated report live under `runs/move_validator_system/benchmarks/<benchmark_id>/`.
+   Use `--input` repeatedly to target a subset (e.g., just the late-endgame cases) while keeping the iteration count. Repeat `--system` to compare different validators side-by-side. Every iteration is logged like a normal `psf run`, per-system artifacts land under `runs/<system_id>/benchmarks/<benchmark_id>/`, and a suite-level report (with cross-system accuracy) is written to `runs/benchmarks/<benchmark_id>/suite_summary.json`.
 
 ## Move validator samples
 
@@ -67,6 +68,7 @@ Run structured accuracy sweeps on any labeled system by comparing an expected in
 ```bash
 psf benchmark \
   --system systems/move_validator_system.yaml \
+  --system systems/move_validator_single_pass.yaml \
   --inputs-dir examples/input/move_validator \
   --iterations 20 \
   --expect-field expected_legality \
@@ -74,10 +76,11 @@ psf benchmark \
   --run-dir runs
 ```
 
+- Repeat `--system` to benchmark multiple definitions at once (each must accept the same input schema).  
 - `--inputs-dir` scans a directory for JSON/YAML inputs (use `--input` repeatedly to target individual files).  
 - `--iterations` controls how many times each scenario is executed, which is handy for spotting stochastic model errors.  
 - Per-iteration artifacts (including prompts and responses) land under `runs/<system_id>/benchmarks/<benchmark_id>/<benchmark_id>-<scenario>-<iteration>/`.  
-- A structured summary is saved at `runs/<system_id>/benchmarks/<benchmark_id>/benchmark_summary.json`, and the command still prints per-scenario accuracy with detailed mismatch logs before exiting non-zero when a scenario fails.
+- Each system receives its own `benchmark_summary.json`, and a cross-system `suite_summary.json` is saved at `runs/benchmarks/<benchmark_id>/` so you can diff accuracy tables later. The CLI still prints per-scenario accuracy plus mismatch logs and exits non-zero when any system disagrees with the expected label.
 
 ## CLI overview
 
@@ -86,7 +89,7 @@ psf benchmark \
 | `psf run --system <path> --input <path>` | Execute a system with structured input, log artifacts, and print the final mapped output. Add `--stdin` to pipe JSON or `--dry-run` to only validate config+input. |
 | `psf validate --system <path>` | Schema + wiring validation (node IDs, bindings, routing, loop targets, system input/output definition). |
 | `psf inspect --system <path>` | Textual graph inspection listing providers, models, routing edges, and loop metadata. |
-| `psf benchmark --system <path> --inputs-dir <dir>` | Re-run labeled scenarios multiple times, log each run, persist a JSON summary, and report accuracy. |
+| `psf benchmark --system <path> --inputs-dir <dir>` | Re-run labeled scenarios multiple times, log each run, persist per-system and suite summaries, and compare accuracies across systems. |
 | `psf replay --run <run.json or dir>` | Re-run a stored snapshot (`system.yaml` + `input.json`) and capture a fresh run in the current runs directory. |
 
 ## Project layout
