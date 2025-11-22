@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-import re
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from jinja2 import Environment, StrictUndefined, TemplateError
@@ -15,6 +15,7 @@ from .models import InputBinding, NodeDef, RoutingRule, SystemDef
 from .providers import LLMProvider, LLMResult, get_provider
 
 _JINJA_ENV = Environment(autoescape=False, undefined=StrictUndefined, trim_blocks=True, lstrip_blocks=True)
+_CODE_BLOCK_RE = re.compile(r"```(?:json)?\s*([\s\S]+?)```", re.IGNORECASE)
 
 
 @dataclass
@@ -333,8 +334,9 @@ class ExecutionEngine:
 def _handle_structured_output(node: NodeDef, raw_text: str) -> Optional[dict[str, Any]]:
     if node.output_mode == "raw":
         return None
+    candidate = _extract_json_candidate(raw_text)
     try:
-        parsed = json.loads(raw_text)
+        parsed = json.loads(candidate)
     except json.JSONDecodeError as exc:
         raise RecoverableExecutionError(
             f"Node '{node.id}' produced invalid JSON output: {exc}"
@@ -342,6 +344,14 @@ def _handle_structured_output(node: NodeDef, raw_text: str) -> Optional[dict[str
     if node.output_schema:
         _validate_schema(parsed, node.output_schema, path=f"node.{node.id}.output")
     return parsed
+
+
+def _extract_json_candidate(text: str) -> str:
+    trimmed = text.strip()
+    match = _CODE_BLOCK_RE.search(trimmed)
+    if match:
+        return match.group(1).strip()
+    return trimmed
 
 
 def _resolve_binding(name: str, binding: InputBinding, context: ContextStore) -> Any:
