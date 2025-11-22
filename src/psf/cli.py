@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import copy
 import json
+import re
+import secrets
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -35,10 +38,13 @@ class BenchmarkScenario:
 
 
 @dataclass
-class BenchmarkMismatch:
+class BenchmarkIterationRecord:
     iteration: int
-    actual_label: str
-    detail: str
+    run_dir: Optional[str]
+    expected_label: str
+    actual_label: Optional[str]
+    status: str
+    detail: Optional[str]
 
 
 @dataclass
@@ -46,11 +52,15 @@ class BenchmarkResult:
     scenario: BenchmarkScenario
     total_runs: int
     successes: int
-    mismatches: List[BenchmarkMismatch]
+    iterations: List[BenchmarkIterationRecord]
 
     @property
     def failures(self) -> int:
         return self.total_runs - self.successes
+
+    @property
+    def mismatches(self) -> List[BenchmarkIterationRecord]:
+        return [record for record in self.iterations if record.status != "success"]
 
 
 def _resolve_path(path: str | Path) -> Path:
@@ -129,8 +139,9 @@ def benchmark(
     iterations: int = typer.Option(5, "--iterations", min=1, help="Number of runs per scenario"),
     expect_field: str = typer.Option("expected_legality", "--expect-field", help="Input field containing the expected legality label"),
     output_field: str = typer.Option("is_legal", "--output-field", help="System output field to compare"),
+    run_dir: str = typer.Option(DEFAULT_RUN_DIR, "--run-dir", help="Directory to store per-iteration artifacts"),
 ) -> None:
-    """Run multiple labeled inputs repeatedly and report accuracy statistics."""
+    """Run multiple labeled inputs repeatedly, logging each run and reporting accuracy statistics."""
     system_path = _resolve_path(system)
     system_def = _load_system_cli(system_path)
     scenario_paths = _collect_scenario_paths(inputs_dir, input)
@@ -138,11 +149,40 @@ def benchmark(
         raise typer.BadParameter("No benchmark inputs provided. Use --inputs-dir and/or --input.")
     scenarios = _load_benchmark_scenarios(scenario_paths, expect_field)
     engine = ExecutionEngine(system_def)
+    run_root = Path(run_dir).expanduser().resolve()
+    run_root.mkdir(parents=True, exist_ok=True)
+    benchmark_id = _generate_benchmark_id()
+    benchmark_root = run_root / system_def.id / "benchmarks" / benchmark_id
+    benchmark_root.mkdir(parents=True, exist_ok=False)
+    started_at = datetime.now(timezone.utc)
     results: list[BenchmarkResult] = []
     for scenario in scenarios:
-        result = _run_benchmark_for_scenario(engine, scenario, iterations, output_field)
+        result = _run_benchmark_for_scenario(
+            engine=engine,
+            system=system_def,
+            scenario=scenario,
+            iterations=iterations,
+            output_field=output_field,
+            run_root=run_root,
+            benchmark_id=benchmark_id,
+            system_path=system_path,
+        )
         results.append(result)
-    _print_benchmark_summary(results)
+    finished_at = datetime.now(timezone.utc)
+    summary_path = benchmark_root / "benchmark_summary.json"
+    _write_benchmark_summary(
+        summary_path=summary_path,
+        system=system_def,
+        benchmark_id=benchmark_id,
+        results=results,
+        started_at=started_at,
+        finished_at=finished_at,
+        expect_field=expect_field,
+        output_field=output_field,
+        iterations_per_scenario=iterations,
+    )
+    _print_benchmark_summary(results, summary_path)
+    typer.echo(f"Benchmark artifacts stored under: {benchmark_root}")
     if any(result.failures for result in results):
         raise typer.Exit(code=1)
 
@@ -292,66 +332,84 @@ def _load_benchmark_scenarios(paths: list[Path], expect_field: str) -> list[Benc
 
 def _run_benchmark_for_scenario(
     engine: ExecutionEngine,
+    system: SystemDef,
     scenario: BenchmarkScenario,
     iterations: int,
     output_field: str,
+    run_root: Path,
+    benchmark_id: str,
+    system_path: Path,
 ) -> BenchmarkResult:
-    mismatches: list[BenchmarkMismatch] = []
+    iteration_records: list[BenchmarkIterationRecord] = []
     successes = 0
+    scenario_slug = _sanitize_name(scenario.name)
     for idx in range(iterations):
         payload = copy.deepcopy(scenario.payload)
+        run_id = f"{benchmark_id}-{scenario_slug}-{idx + 1:03d}"
+        run_logger = RunLogger(run_root, system, run_id=run_id)
+        run_logger.snapshot_system()
+        run_logger.snapshot_input(payload)
         try:
             result = engine.run(payload)
         except ExecutionError as exc:  # pragma: no cover - network/provider errors
-            mismatches.append(
-                BenchmarkMismatch(iteration=idx + 1, actual_label="error", detail=str(exc))
+            result = ExecutionResult(
+                status="failure",
+                final_output=None,
+                context={"runtime": {}},
+                node_results=[],
+                metrics={},
+                error=str(exc),
             )
-            continue
+        for record in result.node_results:
+            run_logger.log_node(record)
+        run_logger.finalize(result, config_path=system_path)
+        iteration_status = "success"
+        actual_label: Optional[str] = None
+        detail: Optional[str] = None
         if result.status != "success" or result.final_output is None:
+            iteration_status = "error"
+            actual_label = "error"
             detail = result.error or "run failed without final output"
-            mismatches.append(BenchmarkMismatch(iteration=idx + 1, actual_label="error", detail=detail))
-            continue
-        final_output = result.final_output
-        if output_field not in final_output:
-            mismatches.append(
-                BenchmarkMismatch(
-                    iteration=idx + 1,
-                    actual_label="missing",
-                    detail=f"final output missing '{output_field}'",
-                )
-            )
-            continue
-        try:
-            actual_bool = _coerce_bool(final_output[output_field])
-        except ValueError as exc:
-            mismatches.append(
-                BenchmarkMismatch(
-                    iteration=idx + 1,
-                    actual_label="invalid",
-                    detail=f"{exc}",
-                )
-            )
-            continue
-        if actual_bool == scenario.expected_bool:
-            successes += 1
         else:
-            reason = final_output.get("reason") or "mismatched legality"
-            mismatches.append(
-                BenchmarkMismatch(
-                    iteration=idx + 1,
-                    actual_label="legal" if actual_bool else "illegal",
-                    detail=reason,
-                )
+            final_output = result.final_output
+            if output_field not in final_output:
+                iteration_status = "missing_output"
+                actual_label = "missing"
+                detail = f"final output missing '{output_field}'"
+            else:
+                try:
+                    actual_bool = _coerce_bool(final_output[output_field])
+                    actual_label = "legal" if actual_bool else "illegal"
+                except ValueError as exc:
+                    iteration_status = "invalid_output"
+                    actual_label = "invalid"
+                    detail = str(exc)
+                else:
+                    if actual_bool == scenario.expected_bool:
+                        successes += 1
+                        detail = final_output.get("reason")
+                    else:
+                        iteration_status = "mismatch"
+                        detail = final_output.get("reason") or "mismatched legality"
+        iteration_records.append(
+            BenchmarkIterationRecord(
+                iteration=idx + 1,
+                run_dir=str(run_logger.run_dir),
+                expected_label=scenario.expected_label,
+                actual_label=actual_label,
+                status=iteration_status,
+                detail=detail,
             )
+        )
     return BenchmarkResult(
         scenario=scenario,
         total_runs=iterations,
         successes=successes,
-        mismatches=mismatches,
+        iterations=iteration_records,
     )
 
 
-def _print_benchmark_summary(results: list[BenchmarkResult]) -> None:
+def _print_benchmark_summary(results: list[BenchmarkResult], summary_path: Optional[Path] = None) -> None:
     if not results:
         typer.echo("No benchmark scenarios executed.")
         return
@@ -372,15 +430,17 @@ def _print_benchmark_summary(results: list[BenchmarkResult]) -> None:
     failures = [res for res in results if res.failures]
     if not failures:
         typer.secho("\nAll scenarios matched the expected legality labels.", fg=typer.colors.GREEN)
-        return
-    typer.secho(f"\n{len(failures)} scenario(s) had mismatches:", fg=typer.colors.YELLOW)
-    for result in failures:
-        typer.secho(f"- {result.scenario.name}: {result.failures}/{result.total_runs} incorrect", fg=typer.colors.YELLOW)
-        for mismatch in result.mismatches:
-            typer.echo(
-                f"    iteration {mismatch.iteration}: predicted {mismatch.actual_label} "
-                f"(expected {result.scenario.expected_label}) -> {mismatch.detail}"
-            )
+    else:
+        typer.secho(f"\n{len(failures)} scenario(s) had mismatches:", fg=typer.colors.YELLOW)
+        for result in failures:
+            typer.secho(f"- {result.scenario.name}: {result.failures}/{result.total_runs} incorrect", fg=typer.colors.YELLOW)
+            for mismatch in result.mismatches:
+                typer.echo(
+                    f"    iteration {mismatch.iteration}: predicted {mismatch.actual_label} "
+                    f"(expected {mismatch.expected_label}) -> {mismatch.detail}"
+                )
+    if summary_path:
+        typer.echo(f"\nBenchmark summary saved to: {summary_path}")
 
 
 def _coerce_bool(value: Any) -> bool:
@@ -398,6 +458,72 @@ def _coerce_bool(value: Any) -> bool:
         if normalized in _FALSE_LABELS:
             return False
     raise ValueError("expected a boolean-like label (legal/illegal, true/false, 1/0)")
+
+
+def _sanitize_name(value: str) -> str:
+    normalized = value.strip().lower()
+    normalized = re.sub(r"[^a-z0-9]+", "-", normalized)
+    normalized = normalized.strip("-")
+    return normalized or "scenario"
+
+
+def _generate_benchmark_id() -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    suffix = secrets.token_hex(3)
+    return f"benchmark_{timestamp}_{suffix}"
+
+
+def _write_benchmark_summary(
+    summary_path: Path,
+    *,
+    system: SystemDef,
+    benchmark_id: str,
+    results: list[BenchmarkResult],
+    started_at: datetime,
+    finished_at: datetime,
+    expect_field: str,
+    output_field: str,
+    iterations_per_scenario: int,
+) -> None:
+    summary: dict[str, Any] = {
+        "system_id": system.id,
+        "system_label": system.label,
+        "system_version": system.version,
+        "benchmark_id": benchmark_id,
+        "benchmark_dir": str(summary_path.parent),
+        "started_at": started_at.isoformat(),
+        "finished_at": finished_at.isoformat(),
+        "expect_field": expect_field,
+        "output_field": output_field,
+        "iterations_per_scenario": iterations_per_scenario,
+        "scenario_count": len(results),
+        "scenarios": [],
+    }
+    for result in results:
+        accuracy = (result.successes / result.total_runs) if result.total_runs else 0.0
+        scenario_entry = {
+            "name": result.scenario.name,
+            "path": str(result.scenario.path),
+            "expected_label": result.scenario.expected_label,
+            "total_runs": result.total_runs,
+            "successes": result.successes,
+            "failures": result.failures,
+            "accuracy": accuracy,
+            "runs": [
+                {
+                    "iteration": record.iteration,
+                    "run_dir": record.run_dir,
+                    "status": record.status,
+                    "expected_label": record.expected_label,
+                    "actual_label": record.actual_label,
+                    "detail": record.detail,
+                }
+                for record in result.iterations
+            ],
+        }
+        summary["scenarios"].append(scenario_entry)
+    with summary_path.open("w", encoding="utf-8") as fh:
+        json.dump(summary, fh, indent=2, ensure_ascii=False)
 
 
 if __name__ == "__main__":  # pragma: no cover

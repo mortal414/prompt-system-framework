@@ -47,7 +47,7 @@ Config-first framework for authoring and running systems of prompts – graphs o
      --inputs-dir examples/input/move_validator \
      --iterations 20
    ```
-   Use `--input` repeatedly to target a subset (e.g., just the late-endgame cases) while keeping the iteration count.
+   Use `--input` repeatedly to target a subset (e.g., just the late-endgame cases) while keeping the iteration count. Every iteration is logged like a normal `psf run`, and a consolidated report is written under `runs/move_validator_system/benchmarks/<benchmark_id>/benchmark_summary.json`.
 
 ## Move validator samples
 
@@ -70,12 +70,14 @@ psf benchmark \
   --inputs-dir examples/input/move_validator \
   --iterations 20 \
   --expect-field expected_legality \
-  --output-field is_legal
+  --output-field is_legal \
+  --run-dir runs
 ```
 
 - `--inputs-dir` scans a directory for JSON/YAML inputs (use `--input` repeatedly to target individual files).  
 - `--iterations` controls how many times each scenario is executed, which is handy for spotting stochastic model errors.  
-- The command prints per-scenario accuracy plus detailed mismatch logs and exits non-zero when any scenario fails.
+- Per-iteration artifacts (including prompts and responses) land under `runs/<system_id>/<benchmark_id>-<scenario>-<iteration>/`.  
+- A structured summary is saved at `runs/<system_id>/benchmarks/<benchmark_id>/benchmark_summary.json`, and the command still prints per-scenario accuracy with detailed mismatch logs before exiting non-zero when a scenario fails.
 
 ## CLI overview
 
@@ -84,7 +86,7 @@ psf benchmark \
 | `psf run --system <path> --input <path>` | Execute a system with structured input, log artifacts, and print the final mapped output. Add `--stdin` to pipe JSON or `--dry-run` to only validate config+input. |
 | `psf validate --system <path>` | Schema + wiring validation (node IDs, bindings, routing, loop targets, system input/output definition). |
 | `psf inspect --system <path>` | Textual graph inspection listing providers, models, routing edges, and loop metadata. |
-| `psf benchmark --system <path> --inputs-dir <dir>` | Re-run labeled scenarios multiple times, compare expected vs actual outputs, and summarize accuracy. |
+| `psf benchmark --system <path> --inputs-dir <dir>` | Re-run labeled scenarios multiple times, log each run, persist a JSON summary, and report accuracy. |
 | `psf replay --run <run.json or dir>` | Re-run a stored snapshot (`system.yaml` + `input.json`) and capture a fresh run in the current runs directory. |
 
 ## Project layout
