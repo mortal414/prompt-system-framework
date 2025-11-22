@@ -66,4 +66,4 @@ prompt-system-framework-v0.md  # Spec/roadmap for future work
 - Expand provider layer (multi-provider support, custom params).  
 - Introduce richer routing (JMESPath/JSONPath) and better testing utilities.  
 - Build the planned UI atop these explicit configs once the engine stabilizes.
-
+- Use System within another system: allow user to start small and build simple systems (move validator) and then directly import them into larger more complex systems (chess move system)
