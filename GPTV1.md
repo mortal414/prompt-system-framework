@@ -45,7 +45,7 @@ Create a framework for designing and running **systems of prompting** – not ju
 
 A **System** is:
 
-- A set of nodes connected as a **graph** (DAG or graph with limited loops).
+- A set of nodes connected as a **graph** (not DAG because there can be cycles).
 - A defined **overall input**:
   - What the user (or client) provides at the start.
 - A defined **overall output**:
@@ -258,46 +258,43 @@ We can **test** `validate_move` in isolation with a suite of known legal/illegal
 
 ---
 
-## 8. Open Design Questions (To Answer Before/While Designing)
+## 8. Open Design Questions 
 
-These are the **important unknowns** you’ll want to clarify.
+These are the **important unknowns**.
 
 ### 8.1 Primary Use Cases
 
-- What are the **first concrete use cases** you want to support?
-  - Chess pipelines?
-  - Debate/argument builders?
-  - Code review flows?
+- What are the **first use cases/examples** to support?
+  - Chess pipelines? Easy example so yes, we can start with just a move validator system, the attatch that system to a larger move decider system and see if it gives better results than a single llm.
+  - Code review flows? Not a bad idea, but for the sake of implementation lets avoid this because its more complex.
   - Data cleaning / classification chains?
-- Are you optimizing for:
-  - **Your own experimentation and research**, or
-  - A **general-purpose framework** that others might use?
+- We are optimizing for: A **general-purpose framework** that others might use.
 
 ### 8.2 System Definition Format
 
 - How should systems be defined and stored?
   - YAML/JSON configuration files?
   - Python code (class/DSL)?
-  - Both (e.g., config + optional Python hooks)?
+  - Both (e.g., config + optional Python hooks)? Likely both, we will need to have them stored externally in some file so that we can save and test them properly.
 - Do you want to be able to:
   - Generate configs from a CLI wizard?
   - Edit configs directly in a text editor?
-  - Both?
+  - Both? Not both, we can edit systems in a text editor first, and then later on with the UI.
 
 ### 8.3 Node I/O and Type System
 
 - How strict should **node outputs** be?
-  - Must every node return **valid JSON** matching a schema?
-  - Is “best-effort JSON with validation + fallback” acceptable?
-  - Do you want to support arbitrary text + parsing rules?
+  - Must every node return **valid JSON** matching a schema? Not necessarily
+  - Is “best-effort JSON with validation + fallback” acceptable? maybe
+  - In regards to the above 2 points, I think we can make support for structure outputs and for normal outputs. Let me propose an example: an llm will preform more accurately on its task when the task is simpler and doesnt contain instructions for a structured output. In that case we should not require a structured output, and instead use another node thats only role is to convert the previous nodes output into the formatted json. Making structured outputs 2 llm calls instead of 1, but possibly increase the output accuracy.
 
-- What types should the framework support out of the box?
+- What types should the framework support out of the box? Not sure what this means even please elaborate.
   - Simple primitives: string, number, boolean.
   - Arrays / lists.
   - Nested objects.
   - Enums (e.g., `"ACCEPT" | "REJECT" | "RETRY"`).
 
-- How are **types and schemas** specified?
+- How are **types and schemas** specified? Not sure what this means even please elaborate.
   - Simple ad-hoc notation in YAML?
   - JSON Schema?
   - Python dataclasses / Pydantic models?
@@ -305,30 +302,32 @@ These are the **important unknowns** you’ll want to clarify.
 ### 8.4 Models & Providers
 
 - Do you want:
-  - One global model/provider per system?
-  - Per-node model selection?
+  - One global model/provider per system? Ideally configurable providers, but we will only start with one (OPENAI) so we only need to plan for that, however in the future it may come up to add providers.
+  - Per-node model selection? Ideally per node model selection.
 - Are there constraints on:
-  - API providers (OpenAI only? multiple providers)?
-  - Rate limits or cost ceilings per run?
+  - API providers (OpenAI only? multiple providers)? No constraint, starting with OAI
+  - Rate limits or cost ceilings per run? No constraints, but maybe log/track these metrics.
 
 ### 8.5 Control Flow Complexity
 
 - What level of branching complexity do you want to support initially?
-  - Simple `if/else` based on boolean fields?
-  - Comparisons: `score > threshold`, string matching, etc.?
+  - Simple `if/else` based on boolean fields? Y
+  - Comparisons: `score > threshold`, string matching, etc.? Y
   - More complex expressions?
 
 - Do you want **loops** (e.g., retry until success) baked in?
   - If yes, how to constrain them?
-    - Max iterations per loop?
-    - Manual stop conditions?
+    - Max iterations per loop? Y
+    - Manual stop conditions? Y
+    - Plan for both, a user should be able to configure either as a loop condition.
 
 - How should **errors** be treated by default?
-  - Immediate failure?
-  - Retry logic (with backoff)?
+  - Immediate failure? 
+  - Retry logic (with backoff)? Y 
   - Special “error handler” nodes?
 
 ### 8.6 Testing Strategy
+We will implement testing later after we have started developing the framework. These questions will be answered then. 
 
 - How do you want to **author tests**?
   - As YAML test files?
@@ -345,18 +344,19 @@ These are the **important unknowns** you’ll want to clarify.
 ### 8.7 Execution & Observability
 
 - How should runs be **logged**?
-  - Plain-text logs?
-  - Structured logs (JSON lines per node)?
+  - Plain-text logs? N
+  - Structured logs (JSON lines per node)? Y
 - Do you want the ability to:
-  - Replay a previous run with the same inputs?
-  - Compare runs (before vs after prompt changes)?
+  - Replay a previous run with the same inputs? Y 
+  - Compare runs (before vs after prompt changes)? Y
 
 - What metadata should be stored per run?
-  - System definition version?
-  - Node versions?
-  - Model identifiers & temperatures?
+  - System definition version? Y
+  - Node versions? Y
+  - Model identifiers & temperatures? Y
 
 ### 8.8 Future UI Considerations
+We will implement UI at the end, after we have a solid framework. These questions will be answered then. 
 
 - Should the UI operate directly on the same **system definition files** used by the CLI?
 - What UI operations are essential?
@@ -383,5 +383,3 @@ When you’re ready, you can:
    - Node schema.
    - Test format.
    - Control flow and error handling.
-
-That small example will make many of the open questions easier to answer.

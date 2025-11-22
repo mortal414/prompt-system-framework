@@ -1,55 +1,69 @@
-# What
-A system to easily create a "system of prompting"  
-Final project will contain a UI for making system of prompting  
-## Design
-Start with making CLI to create a simple system. Must define expected input and output. Then define how many LLM passes to make, and create templates for each pass. Harder part might be structured output.
-If a sub prompt is something like:  
-Given X, Tell us Y and Z. Then Y and Z are used independantly in other prompts.
-Different possibilities: depending on the response of a subprompt, we may want to trigger different flows.   
-Overall, the input and output will behave like a current chatbot, but the underlying system will consist of multiple llm prompts and flows depending on outputs that will eventually reach a more accurate response.
-## 
-User can:
-- "+" add nodes in a graph
-- "-" remove nodes from a graph
-- Inspect and edit templates for nodes
-- When adding a node, must decide where the input comes from, and where the output goes
-- Removing node must deal with the same issues
-- There must be an overall input and an overall output of the entire system
-- 
+# Prompt System Framework (v0)
 
-What is a node in the graph?
-Node is a instruction + prompt for an llm. It has some input, either absolute input or from another node. This input is assembled into a prompt along with instructions. The prompt assembly is decided by some template.
-Nodes are in some way just an automatic prompting of an llm (currently api only) where the inputs are either user provided (at start of system) or automatically passed from a previous node.
+Config-first framework for authoring and running systems of prompts – graphs of LLM-powered nodes with explicit inputs, outputs, and routing flows. The long-term goal is still the UI described originally, but v0 focuses on a Python engine and CLI so we can define, execute, and observe systems immediately.
 
+## What’s in v0
 
-Testing:
-Depending on the systems goals we can write tests, and even test individual nodes within a system. Actually, tests should be encorporated as an important part of the project. Its easy and useless to design a simple prompt system framework, but its much more useful to easily design and test it.   
-Chess example:
+- **Config-driven systems** defined in YAML/JSON with explicit system inputs/outputs, node graphs, routing rules, and loop controls.  
+- **Execution engine** that renders prompts with Jinja2, calls OpenAI via a provider abstraction, validates structured JSON outputs, tracks context, tokens, and routing decisions.  
+- **CLI (`psf`)** with `run`, `validate`, `inspect`, and `replay` commands plus logging of every run (system snapshot, input snapshot, per-node logs, aggregated metrics).  
+- **Chess example** (`systems/chess_move_system.yaml`) showing a multi-node workflow with parsing, validation, and retry loops.  
+- **Run artifacts** stored under `runs/<system_id>/<run_id>/` containing `run.json`, `nodes.jsonl`, `system.yaml`, and `input.json` for replay/debugging.
 
+## Quick start
 
-- give a chess move
-- Is this a valid move
-- Depending on answer if no, circle back to start with provided context.
+1. **Install dependencies**
+   ```bash
+   python3 -m venv .venv && source .venv/bin/activate
+   pip install -e .
+   ```
+2. **Configure OpenAI credentials**
+   ```bash
+   export OPENAI_API_KEY=sk-...
+   ```
+3. **Validate the sample system**
+   ```bash
+   psf validate --system systems/chess_move_system.yaml
+   ```
+4. **Run the chess pipeline**
+   ```bash
+   psf run \
+     --system systems/chess_move_system.yaml \
+     --input examples/input/chess_position_1.json
+   ```
+   Artifacts land under `runs/chess_move_system/<run_id>/`.
 
-We can test the "is this a valid move" part independently by passing moves that we know are valid or not.
+## CLI overview
 
-Create some examples:
-- Simple agent example?
-- Chess example
-- Advanced social media example
+| Command | Description |
+| --- | --- |
+| `psf run --system <path> --input <path>` | Execute a system with structured input, log artifacts, and print the final mapped output. Add `--stdin` to pipe JSON or `--dry-run` to only validate config+input. |
+| `psf validate --system <path>` | Schema + wiring validation (node IDs, bindings, routing, loop targets, system input/output definition). |
+| `psf inspect --system <path>` | Textual graph inspection listing providers, models, routing edges, and loop metadata. |
+| `psf replay --run <run.json or dir>` | Re-run a stored snapshot (`system.yaml` + `input.json`) and capture a fresh run in the current runs directory. |
 
+## Project layout
 
+```
+pyproject.toml
+src/psf/
+  cli.py            # Typer CLI entrypoint
+  config_loader.py  # YAML/JSON → SystemDef with wiring validation
+  engine.py         # Execution engine, routing DSL, schema validation
+  providers/        # Provider registry + OpenAI implementation
+  logging/          # Run logger writing run.json + nodes.jsonl
+systems/
+  chess_move_system.yaml
+examples/input/
+  chess_position_1.json
+runs/
+  ... created per psf run
+prompt-system-framework-v0.md  # Spec/roadmap for future work
+```
 
+## Next steps
 
-
-NODE:
-
-TEMPLATE:  
-
-CONNECTION:
-
-INPUT:
-
-OUTPUT:
-
+- Expand provider layer (multi-provider support, custom params).  
+- Introduce richer routing (JMESPath/JSONPath) and better testing utilities.  
+- Build the planned UI atop these explicit configs once the engine stabilizes.
 
