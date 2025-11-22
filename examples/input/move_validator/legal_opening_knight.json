@@ -1,0 +1,6 @@
+{
+  "position_fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+  "candidate_move": "Nf3",
+  "move_context": "Standard king-side knight development on move one.",
+  "expected_legality": "legal"
+}

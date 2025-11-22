@@ -1,0 +1,6 @@
+{
+  "position_fen": "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 2 3",
+  "candidate_move": "Qxf7#",
+  "move_context": "Trying to imitate the classic checkmate pattern without sufficient development.",
+  "expected_legality": "illegal"
+}

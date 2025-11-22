@@ -8,6 +8,7 @@ Config-first framework for authoring and running systems of prompts – graphs o
 - **Execution engine** that renders prompts with Jinja2, calls OpenAI via a provider abstraction, validates structured JSON outputs, tracks context, tokens, and routing decisions.  
 - **CLI (`psf`)** with `run`, `validate`, `inspect`, and `replay` commands plus logging of every run (system snapshot, input snapshot, per-node logs, aggregated metrics).  
 - **Chess example** (`systems/chess_move_system.yaml`) showing a multi-node workflow with parsing, validation, and retry loops.  
+- **Move validator example** (`systems/move_validator_system.yaml`) for adjudicating pre-generated moves against a FEN with double-check routing when a move looks illegal.  
 - **Run artifacts** stored under `runs/<system_id>/<run_id>/` containing `run.json`, `nodes.jsonl`, `system.yaml`, and `input.json` for replay/debugging.
 
 ## Quick start
@@ -32,6 +33,24 @@ Config-first framework for authoring and running systems of prompts – graphs o
      --input examples/input/chess_position_1.json
    ```
    Artifacts land under `runs/chess_move_system/<run_id>/`.
+5. **Probe the move validator against known labels**
+   ```bash
+   psf run \
+     --system systems/move_validator_system.yaml \
+     --input examples/input/move_validator/legal_opening_knight.json
+   ```
+   Swap the input file with any other JSON in `examples/input/move_validator/` (legal or illegal) to observe how the validator reacts.
+
+## Move validator samples
+
+`examples/input/move_validator/` collects FEN + move pairs with a known legality label so you can quickly regression-test the validator graph or feed its output back into the move generator loop.
+
+- `legal_opening_knight.json` – standard `Nf3` development from the initial position.  
+- `legal_middlegame_capture.json` – Ruy Lopez bishop capture with check in a crowded middlegame.  
+- `legal_endgame_king_walk.json` – calm king centralization in a king-and-pawn ending.  
+- `illegal_starting_queen_ray.json` – early `Qh5` attempt blocked by the pawn wall on the first move.  
+- `illegal_middlegame_queen_capture.json` – premature `Qxf7#` when own pawn still blocks the queen’s diagonal.  
+- `illegal_endgame_king_into_check.json` – king tries to step onto d3 while a black rook on d4 covers the square.
 
 ## CLI overview
 
@@ -54,8 +73,16 @@ src/psf/
   logging/          # Run logger writing run.json + nodes.jsonl
 systems/
   chess_move_system.yaml
+  move_validator_system.yaml
 examples/input/
   chess_position_1.json
+  move_validator/
+    legal_opening_knight.json
+    legal_middlegame_capture.json
+    legal_endgame_king_walk.json
+    illegal_starting_queen_ray.json
+    illegal_middlegame_queen_capture.json
+    illegal_endgame_king_into_check.json
 runs/
   ... created per psf run
 prompt-system-framework-v0.md  # Spec/roadmap for future work

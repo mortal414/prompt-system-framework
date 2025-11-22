@@ -1,0 +1,6 @@
+{
+  "position_fen": "8/8/2k5/1p6/1P6/3K4/8/8 w - - 0 1",
+  "candidate_move": "Ke4",
+  "move_context": "Centralize the king in a simple king-and-pawn ending.",
+  "expected_legality": "legal"
+}

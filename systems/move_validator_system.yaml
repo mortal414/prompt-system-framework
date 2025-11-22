@@ -1,0 +1,183 @@
+id: "move_validator_system"
+label: "Chess Move Legality Validator"
+version: "0.1.0"
+entry_node_id: "primary_validation"
+
+provider_defaults:
+  openai:
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 512
+
+system_input:
+  fields:
+    position_fen:
+      type: string
+      required: true
+      description: "Board state in Forsyth–Edwards Notation"
+    candidate_move:
+      type: string
+      required: true
+      description: "Move to validate, preferably SAN or long algebraic"
+    move_context:
+      type: string
+      required: false
+      description: "Optional human-provided intent or notes"
+    expected_legality:
+      type: string
+      required: false
+      description: "Optional ground-truth tag (legal/illegal) for testing"
+
+system_output:
+  fields:
+    is_legal:
+      from: "node.final_response.output.is_legal"
+    reason:
+      from: "node.final_response.output.reason"
+    confidence:
+      from: "node.final_response.output.confidence"
+    message:
+      from: "node.final_response.output.message"
+    recommendation:
+      from: "node.final_response.output.recommendation"
+
+nodes:
+  - id: "primary_validation"
+    label: "Primary legality check"
+    instructions: |
+      You are a strict chess arbiter. Determine whether the provided move is legal in the exact FEN position.
+      Only use rules of chess (move patterns, pins, captures, check, castling, en passant, promotion, and side to move).
+    prompt_template: |
+      Position (FEN): {{ position_fen }}
+      Candidate move: {{ candidate_move }}
+      {% if move_context %}Context: {{ move_context }}{% endif %}
+
+      Respond with minified JSON:
+      {
+        "is_legal": true|false,
+        "reason": "<concise explanation>",
+        "confidence": <number 0-1>,
+        "category": "LEGAL" or "ILLEGAL"
+      }
+    input_bindings:
+      position_fen:
+        from: "system.position_fen"
+      candidate_move:
+        from: "system.candidate_move"
+      move_context:
+        from: "system.move_context"
+        required: false
+    output_mode: "structured"
+    output_schema:
+      type: object
+      properties:
+        is_legal:
+          type: boolean
+        reason:
+          type: string
+        confidence:
+          type: number
+        category:
+          type: string
+          enum: ["LEGAL", "ILLEGAL"]
+      required: [is_legal, reason]
+    routing:
+      on_success:
+        - condition: "output.is_legal == true"
+          next: "final_response"
+        - condition: "output.is_legal == false"
+          next: "secondary_review"
+
+  - id: "secondary_review"
+    label: "Secondary review for illegal verdicts"
+    instructions: |
+      A previous arbiter flagged the move as illegal. Double-check that assessment carefully.
+      If you believe the move is actually legal, overturn the decision and explain why.
+      Otherwise, uphold the illegal verdict and highlight the rule that is violated.
+    prompt_template: |
+      Position (FEN): {{ position_fen }}
+      Candidate move: {{ candidate_move }}
+      Initial verdict: {{ initial_verdict }}
+      Initial reason: {{ initial_reason }}
+
+      Respond with JSON:
+      {
+        "final_is_legal": true|false,
+        "details": "<short justification>",
+        "retry_hint": "<advice to improve future move generation>"
+      }
+    input_bindings:
+      position_fen:
+        from: "system.position_fen"
+      candidate_move:
+        from: "system.candidate_move"
+      initial_verdict:
+        from: "node.primary_validation.output.category"
+      initial_reason:
+        from: "node.primary_validation.output.reason"
+    output_mode: "structured"
+    output_schema:
+      type: object
+      properties:
+        final_is_legal:
+          type: boolean
+        details:
+          type: string
+        retry_hint:
+          type: string
+      required: [final_is_legal, details]
+    routing:
+      on_success:
+        - next: "final_response"
+
+  - id: "final_response"
+    label: "Consolidated verdict"
+    instructions: |
+      Produce the final verdict for the candidate move.
+      Prefer the secondary review result when available; otherwise, use the primary verdict.
+      Include a recommendation for what an upstream move generator should do next (e.g., play move, pick new move, explain issue).
+      Output JSON with the following keys: is_legal, reason, confidence, message, recommendation.
+    prompt_template: |
+      Candidate move: {{ candidate_move }}
+      Primary verdict: {{ primary_verdict }} (reason: {{ primary_reason }}, confidence: {{ primary_confidence }})
+      Secondary review verdict: {{ review_verdict|default("(not run)") }}
+      Secondary details: {{ review_details|default("n/a") }}
+      Retry hint: {{ retry_hint|default("n/a") }}
+      Ground-truth label (if provided): {{ expected_legality|default("unknown") }}
+    input_bindings:
+      candidate_move:
+        from: "system.candidate_move"
+      primary_verdict:
+        from: "node.primary_validation.output.category"
+      primary_reason:
+        from: "node.primary_validation.output.reason"
+      primary_confidence:
+        from: "node.primary_validation.output.confidence"
+      review_verdict:
+        from: "node.secondary_review.output.final_is_legal"
+        required: false
+      review_details:
+        from: "node.secondary_review.output.details"
+        required: false
+      retry_hint:
+        from: "node.secondary_review.output.retry_hint"
+        required: false
+      expected_legality:
+        from: "system.expected_legality"
+        required: false
+    output_mode: "structured"
+    output_schema:
+      type: object
+      properties:
+        is_legal:
+          type: boolean
+        reason:
+          type: string
+        confidence:
+          type: number
+        message:
+          type: string
+        recommendation:
+          type: string
+      required: [is_legal, reason, message, recommendation]
+    terminal: true
