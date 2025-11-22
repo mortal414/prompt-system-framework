@@ -163,7 +163,7 @@ def benchmark(
             scenario=scenario,
             iterations=iterations,
             output_field=output_field,
-            run_root=run_root,
+            benchmark_root=benchmark_root,
             benchmark_id=benchmark_id,
             system_path=system_path,
         )
@@ -336,7 +336,7 @@ def _run_benchmark_for_scenario(
     scenario: BenchmarkScenario,
     iterations: int,
     output_field: str,
-    run_root: Path,
+    benchmark_root: Path,
     benchmark_id: str,
     system_path: Path,
 ) -> BenchmarkResult:
@@ -346,7 +346,7 @@ def _run_benchmark_for_scenario(
     for idx in range(iterations):
         payload = copy.deepcopy(scenario.payload)
         run_id = f"{benchmark_id}-{scenario_slug}-{idx + 1:03d}"
-        run_logger = RunLogger(run_root, system, run_id=run_id)
+        run_logger = RunLogger(benchmark_root, system, run_id=run_id, use_system_subdir=False)
         run_logger.snapshot_system()
         run_logger.snapshot_input(payload)
         try:
@@ -437,7 +437,7 @@ def _print_benchmark_summary(results: list[BenchmarkResult], summary_path: Optio
             for mismatch in result.mismatches:
                 typer.echo(
                     f"    iteration {mismatch.iteration}: predicted {mismatch.actual_label} "
-                    f"(expected {mismatch.expected_label}) -> {mismatch.detail}"
+                    f"(expected {result.scenario.expected_label}) -> {mismatch.detail}"
                 )
     if summary_path:
         typer.echo(f"\nBenchmark summary saved to: {summary_path}")

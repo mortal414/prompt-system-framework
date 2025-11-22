@@ -47,7 +47,7 @@ Config-first framework for authoring and running systems of prompts – graphs o
      --inputs-dir examples/input/move_validator \
      --iterations 20
    ```
-   Use `--input` repeatedly to target a subset (e.g., just the late-endgame cases) while keeping the iteration count. Every iteration is logged like a normal `psf run`, and a consolidated report is written under `runs/move_validator_system/benchmarks/<benchmark_id>/benchmark_summary.json`.
+   Use `--input` repeatedly to target a subset (e.g., just the late-endgame cases) while keeping the iteration count. Every iteration is logged like a normal `psf run`, and both the per-run artifacts _and_ the consolidated report live under `runs/move_validator_system/benchmarks/<benchmark_id>/`.
 
 ## Move validator samples
 
@@ -76,7 +76,7 @@ psf benchmark \
 
 - `--inputs-dir` scans a directory for JSON/YAML inputs (use `--input` repeatedly to target individual files).  
 - `--iterations` controls how many times each scenario is executed, which is handy for spotting stochastic model errors.  
-- Per-iteration artifacts (including prompts and responses) land under `runs/<system_id>/<benchmark_id>-<scenario>-<iteration>/`.  
+- Per-iteration artifacts (including prompts and responses) land under `runs/<system_id>/benchmarks/<benchmark_id>/<benchmark_id>-<scenario>-<iteration>/`.  
 - A structured summary is saved at `runs/<system_id>/benchmarks/<benchmark_id>/benchmark_summary.json`, and the command still prints per-scenario accuracy with detailed mismatch logs before exiting non-zero when a scenario fails.
 
 ## CLI overview

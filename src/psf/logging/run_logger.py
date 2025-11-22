@@ -13,11 +13,20 @@ from ..models import SystemDef
 
 
 class RunLogger:
-    def __init__(self, root: Path, system: SystemDef, *, run_id: str | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        system: SystemDef,
+        *,
+        run_id: str | None = None,
+        use_system_subdir: bool = True,
+    ) -> None:
         self.root = root
         self.system = system
         self.run_id = run_id or _generate_run_id()
-        self.run_dir = self.root / system.id / self.run_id
+        base_dir = (self.root / system.id) if use_system_subdir else self.root
+        base_dir.mkdir(parents=True, exist_ok=True)
+        self.run_dir = base_dir / self.run_id
         self.run_dir.mkdir(parents=True, exist_ok=False)
         self.system_snapshot_path = self.run_dir / "system.yaml"
         self.input_snapshot_path = self.run_dir / "input.json"
