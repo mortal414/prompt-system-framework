@@ -124,11 +124,6 @@ prompt-system-framework-v0.md  # Spec/roadmap for future work
 ```
 
 ## Next steps
-### my shit
-- Use System within another system: allow user to start small and build simple systems (move validator) and then directly import them into larger more complex systems (chess move system)
-- Fix benchmark output. Should be runs/benchmark_someID/. Within here there should be json for entire benchmark summary and folder for each system, in each system folder there should be another json summary, and folders for each run.
-
-### ai shit
 - Expand provider layer (multi-provider support, custom params).  
 - Introduce richer routing (JMESPath/JSONPath) and better testing utilities.  
 - Build the planned UI atop these explicit configs once the engine stabilizes.

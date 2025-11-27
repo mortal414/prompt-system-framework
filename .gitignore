@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 .env
 runs/
+PROJECTPROMPTS/
+NEXTPROMPT.md
+.DS_STORE
