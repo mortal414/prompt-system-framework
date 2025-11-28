@@ -13,6 +13,7 @@ from typing import Any, List, Optional
 import typer
 import yaml
 
+from .chess_generator import ChessScenarioGenerator
 from .config_loader import load_system_definition
 from .engine import ExecutionEngine, ExecutionResult
 from .exceptions import ConfigError, ExecutionError
@@ -167,37 +168,69 @@ def benchmark(
     run_root = Path(run_dir).expanduser().resolve()
     run_root.mkdir(parents=True, exist_ok=True)
     benchmark_id = _generate_benchmark_id()
-    suite_root = run_root / "benchmarks" / benchmark_id
-    suite_root.mkdir(parents=True, exist_ok=False)
-    system_summaries: list[SystemBenchmarkSummary] = []
-    for system_arg in systems:
-        system_path = _resolve_path(system_arg)
-        system_def = _load_system_cli(system_path)
-        typer.echo(f"\n=== Benchmarking system: {system_def.id} ({system_def.label or 'unnamed'}) ===")
-        summary = _run_benchmark_for_system(
-            system_def=system_def,
-            system_path=system_path,
-            scenarios=scenarios,
-            iterations=iterations,
-            output_field=output_field,
-            run_root=run_root,
-            benchmark_id=benchmark_id,
-            expect_field=expect_field,
-        )
-        system_summaries.append(summary)
-        _print_benchmark_summary(summary.scenario_results, summary.summary_path)
-        typer.echo(f"Artifacts stored under: {summary.benchmark_root}")
-    suite_summary_path = suite_root / "suite_summary.json"
-    _write_suite_summary(
-        suite_summary_path,
-        benchmark_id=benchmark_id,
-        system_summaries=system_summaries,
-        expect_field=expect_field,
+    system_paths = [_resolve_path(path) for path in systems]
+    _, _, any_failures = _run_benchmark_suite(
+        system_paths=system_paths,
+        scenarios=scenarios,
+        iterations=iterations,
         output_field=output_field,
-        iterations_per_scenario=iterations,
+        run_root=run_root,
+        benchmark_id=benchmark_id,
+        expect_field=expect_field,
     )
-    _print_system_comparison_table(system_summaries, suite_summary_path)
-    any_failures = any(result.failures for summary in system_summaries for result in summary.scenario_results)
+    if any_failures:
+        raise typer.Exit(code=1)
+
+
+@app.command("auto-benchmark-chess")
+def auto_benchmark_chess(
+    systems: List[str] = typer.Option(..., "--system", "-s", help="Path to system definition (repeat for multiple systems)"),
+    legal: int = typer.Option(10, "--legal", help="How many legal move scenarios to generate"),
+    illegal: int = typer.Option(10, "--illegal", help="How many illegal move scenarios to generate"),
+    iterations: int = typer.Option(3, "--iterations", min=1, help="Number of runs per generated scenario"),
+    min_plies: int = typer.Option(4, "--min-plies", min=0, help="Minimum random plies to play before sampling a move"),
+    max_plies: int = typer.Option(18, "--max-plies", min=0, help="Maximum random plies to play before sampling a move"),
+    seed: Optional[int] = typer.Option(None, "--seed", help="Random seed for reproducible positions"),
+    expect_field: str = typer.Option("expected_legality", "--expect-field", help="Input field containing the expected legality label"),
+    output_field: str = typer.Option("is_legal", "--output-field", help="System output field to compare"),
+    run_dir: str = typer.Option(DEFAULT_RUN_DIR, "--run-dir", help="Directory to store per-iteration artifacts"),
+    inputs_out: Optional[str] = typer.Option(None, "--inputs-out", help="Where to write the generated input JSON files"),
+) -> None:
+    """Generate chess states + moves automatically and benchmark systems against ground truth."""
+    if not systems:
+        raise typer.BadParameter("At least one --system argument is required.")
+    if legal + illegal <= 0:
+        raise typer.BadParameter("Generate at least one scenario (adjust --legal/--illegal).")
+    if max_plies < min_plies:
+        raise typer.BadParameter("--max-plies must be >= --min-plies.")
+    run_root = Path(run_dir).expanduser().resolve()
+    run_root.mkdir(parents=True, exist_ok=True)
+    benchmark_id = _generate_benchmark_id(prefix="auto_chess")
+    suite_root = run_root / "benchmarks" / benchmark_id
+    suite_root.mkdir(parents=True, exist_ok=True)
+    generator = ChessScenarioGenerator(min_plies=min_plies, max_plies=max_plies, seed=seed)
+    scenarios = generator.generate_batch(legal_count=legal, illegal_count=illegal)
+    if expect_field != "expected_legality":
+        for scenario in scenarios:
+            scenario.payload[expect_field] = scenario.payload.pop("expected_legality")
+    inputs_root = Path(inputs_out).expanduser().resolve() if inputs_out else suite_root / "generated_inputs"
+    written_paths = generator.write_scenarios(scenarios, inputs_root)
+    typer.echo(
+        f"Generated {len(written_paths)} scenarios ({legal} legal / {illegal} illegal) at: {inputs_root}"
+    )
+    loaded_scenarios = _load_benchmark_scenarios(written_paths, expect_field)
+    system_paths = [_resolve_path(path) for path in systems]
+    _, _, any_failures = _run_benchmark_suite(
+        system_paths=system_paths,
+        scenarios=loaded_scenarios,
+        iterations=iterations,
+        output_field=output_field,
+        run_root=run_root,
+        benchmark_id=benchmark_id,
+        expect_field=expect_field,
+        suite_root=suite_root,
+    )
+    typer.echo(f"Input artifacts stored under: {inputs_root}")
     if any_failures:
         raise typer.Exit(code=1)
 
@@ -476,6 +509,50 @@ def _run_benchmark_for_system(
     )
 
 
+def _run_benchmark_suite(
+    *,
+    system_paths: List[Path],
+    scenarios: List[BenchmarkScenario],
+    iterations: int,
+    output_field: str,
+    run_root: Path,
+    benchmark_id: str,
+    expect_field: str,
+    suite_root: Optional[Path] = None,
+) -> tuple[List[SystemBenchmarkSummary], Path, bool]:
+    suite_root = suite_root or run_root / "benchmarks" / benchmark_id
+    suite_root.mkdir(parents=True, exist_ok=True)
+    system_summaries: list[SystemBenchmarkSummary] = []
+    for system_path in system_paths:
+        system_def = _load_system_cli(system_path)
+        typer.echo(f"\n=== Benchmarking system: {system_def.id} ({system_def.label or 'unnamed'}) ===")
+        summary = _run_benchmark_for_system(
+            system_def=system_def,
+            system_path=system_path,
+            scenarios=scenarios,
+            iterations=iterations,
+            output_field=output_field,
+            run_root=run_root,
+            benchmark_id=benchmark_id,
+            expect_field=expect_field,
+        )
+        system_summaries.append(summary)
+        _print_benchmark_summary(summary.scenario_results, summary.summary_path)
+        typer.echo(f"Artifacts stored under: {summary.benchmark_root}")
+    suite_summary_path = suite_root / "suite_summary.json"
+    _write_suite_summary(
+        suite_summary_path,
+        benchmark_id=benchmark_id,
+        system_summaries=system_summaries,
+        expect_field=expect_field,
+        output_field=output_field,
+        iterations_per_scenario=iterations,
+    )
+    _print_system_comparison_table(system_summaries, suite_summary_path)
+    any_failures = any(result.failures for summary in system_summaries for result in summary.scenario_results)
+    return system_summaries, suite_summary_path, any_failures
+
+
 def _print_benchmark_summary(results: list[BenchmarkResult], summary_path: Optional[Path] = None) -> None:
     if not results:
         typer.echo("No benchmark scenarios executed.")
@@ -575,10 +652,10 @@ def _sanitize_name(value: str) -> str:
     return normalized or "scenario"
 
 
-def _generate_benchmark_id() -> str:
+def _generate_benchmark_id(*, prefix: str = "benchmark") -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     suffix = secrets.token_hex(3)
-    return f"benchmark_{timestamp}_{suffix}"
+    return f"{prefix}_{timestamp}_{suffix}"
 
 
 def _write_benchmark_summary(

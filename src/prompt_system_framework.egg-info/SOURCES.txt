@@ -7,6 +7,7 @@ src/prompt_system_framework.egg-info/entry_points.txt
 src/prompt_system_framework.egg-info/requires.txt
 src/prompt_system_framework.egg-info/top_level.txt
 src/psf/__init__.py
+src/psf/chess_generator.py
 src/psf/cli.py
 src/psf/config_loader.py
 src/psf/engine.py

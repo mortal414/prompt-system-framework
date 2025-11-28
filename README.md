@@ -84,6 +84,27 @@ psf benchmark \
 - Per-iteration artifacts (including prompts and responses) land under `runs/<system_id>/benchmarks/<benchmark_id>/<benchmark_id>-<scenario>-<iteration>/`.  
 - Each system receives its own `benchmark_summary.json`, and a cross-system `suite_summary.json` is saved at `runs/benchmarks/<benchmark_id>/` so you can diff accuracy tables later. The CLI still prints per-scenario accuracy plus mismatch logs and exits non-zero when any system disagrees with the expected label.
 
+## Auto-generate chess benchmarks
+
+Skip manual JSON creation by generating labeled FEN + move pairs with python-chess and benchmarking them immediately.
+
+```bash
+psf auto-benchmark-chess \
+  --system systems/move_validator_system.yaml \
+  --system systems/move_validator_simple_system.yaml \
+  --system systems/move_validator_consensus_system.yaml \
+  --legal 25 \
+  --illegal 25 \
+  --iterations 5 \
+  --min-plies 6 \
+  --max-plies 18 \
+  --seed 42
+```
+
+- Ground truth legality comes from python-chess; each input includes `position_fen`, `candidate_move`, `move_context`, and the expected label.  
+- Generated inputs land under `runs/benchmarks/<benchmark_id>/generated_inputs/` by default (override with `--inputs-out`).  
+- Suite + per-system summaries are emitted like the normal `psf benchmark` command, so cross-system accuracy comparisons stay the same.
+
 ## CLI overview
 
 | Command | Description |
@@ -92,6 +113,7 @@ psf benchmark \
 | `psf validate --system <path>` | Schema + wiring validation (node IDs, bindings, routing, loop targets, system input/output definition). |
 | `psf inspect --system <path>` | Textual graph inspection listing providers, models, routing edges, and loop metadata. |
 | `psf benchmark --system <path> --inputs-dir <dir>` | Re-run labeled scenarios multiple times, log each run, persist per-system and suite summaries, and compare accuracies across systems. |
+| `psf auto-benchmark-chess --system <path>` | Auto-generate labeled chess positions/moves and benchmark one or more systems without hand-authored inputs. |
 | `psf replay --run <run.json or dir>` | Re-run a stored snapshot (`system.yaml` + `input.json`) and capture a fresh run in the current runs directory. |
 
 ## Project layout
@@ -124,6 +146,7 @@ prompt-system-framework-v0.md  # Spec/roadmap for future work
 ```
 
 ## Next steps
+- Verify System Loops
 - Expand provider layer (multi-provider support, custom params).  
 - Introduce richer routing (JMESPath/JSONPath) and better testing utilities.  
 - Build the planned UI atop these explicit configs once the engine stabilizes.
