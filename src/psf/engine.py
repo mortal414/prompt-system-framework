@@ -245,25 +245,13 @@ class ExecutionEngine:
     def _build_model_config(self, node: NodeDef) -> "ModelConfig":
         from .models import ModelConfig
 
-        provider_name = node.provider
-        provider_defaults = self.system.provider_defaults
-        if not provider_name:
-            if len(provider_defaults) == 1:
-                provider_name = next(iter(provider_defaults.keys()))
-            elif not provider_defaults:
-                provider_name = "openai"
-            else:
-                raise ExecutionError(
-                    f"Node '{node.id}' must specify a provider when multiple provider_defaults are defined"
-                )
-        provider_name = provider_name or "openai"
-        base_config = provider_defaults.get(provider_name)
-        model = node.model or (base_config.model if base_config else None)
+        provider_name = node.provider or "openai"
+        model = node.model
         if not model:
             raise ExecutionError(f"Node '{node.id}' is missing a model configuration")
-        temperature = node.temperature if node.temperature is not None else (base_config.temperature if base_config else None)
-        max_tokens = node.max_tokens if node.max_tokens is not None else (base_config.max_tokens if base_config else None)
-        extra_params = dict(base_config.extra_params) if base_config else {}
+        temperature = node.temperature
+        max_tokens = node.max_tokens
+        extra_params = dict(node.extra_params or {})
         return ModelConfig(
             provider=provider_name,
             model=model,

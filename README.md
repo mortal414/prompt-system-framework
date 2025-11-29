@@ -11,7 +11,7 @@ Config-first framework for running **systems of prompts**: graphs of LLM-powered
 
 ## Architecture at a glance
 
-- **System definition (YAML/JSON)** — declares system inputs/outputs, nodes, routing rules, loop controls, and provider defaults.  
+- **System definition (YAML/JSON)** — declares system inputs/outputs, nodes, routing rules, loop controls, and per-node model settings.  
 - **Execution engine** (`src/psf/engine.py`) — renders Jinja2 prompts, calls providers, enforces schemas, resolves routing/loops, and builds the final output.  
 - **Providers** (`src/psf/providers/`) — OpenAI implementation today; extensible via the registry.  
 - **CLI** (`psf`) — validate configs, inspect graphs, run/replay systems, and benchmark labeled scenarios.  
@@ -26,16 +26,14 @@ A system is a DAG (with optional loops) of nodes. Key pieces you will touch when
 - `routing` — `on_success`, `on_failure`, and `on_loop_exhausted` rules choose the next node; conditions can reference `output.*` or `context.*`.  
 - `loop_control` — increment counters, rerun a target node, and optionally exit when a node succeeds.  
 - `system_output` — maps final fields from context paths such as `node.<id>.output.*` into the returned payload.  
-- `provider_defaults` and per-node overrides set provider/model/temperature/token limits.
+- Per-node model settings (`provider`, `model`, temperature, tokens, extra params) keep multi-model graphs explicit.
 
 Minimal shape (see `systems/chess_move_system.yaml` for a fuller example):
 
 ```yaml
 id: "my_system"
 entry_node_id: "first_node"
-provider_defaults:
-  openai:
-    model: "gpt-4o-mini"
+benchmark_batch_size: 4
 system_input:
   fields:
     task: {type: string, required: true}
@@ -46,6 +44,8 @@ nodes:
   - id: "first_node"
     instructions: "...role/setup..."
     prompt_template: "...rendered with {{ task }}..."
+    provider: "openai"
+    model: "gpt-4o-mini"
     input_bindings:
       task: {from: "system.task"}
     output_mode: "structured"
@@ -56,6 +56,8 @@ nodes:
     terminal: true
     instructions: "Package the final reply"
     prompt_template: "Answer: {{ answer }}"
+    provider: "openai"
+    model: "gpt-4o-mini"
     input_bindings:
       answer: {from: "node.first_node.output.answer"}
     output_mode: "structured"
@@ -98,7 +100,7 @@ nodes:
      --expect-field expected_legality \
      --output-field is_legal
    ```
-   Each benchmark run is grouped under `runs/benchmarks/<benchmark_id>/` with per-system artifacts in subfolders (e.g., `runs/benchmarks/<benchmark_id>/move_validator_system/`) and a cross-system suite report at `runs/benchmarks/<benchmark_id>/suite_summary.json`.
+   Each benchmark run is grouped under `runs/benchmarks/<benchmark_id>/` with per-system artifacts in subfolders (e.g., `runs/benchmarks/<benchmark_id>/move_validator_system/`) and a cross-system suite report at `runs/benchmarks/<benchmark_id>/suite_summary.json`. Benchmark iterations run in batches per system (size is controlled by `benchmark_batch_size` in the system config) and use the OpenAI Batch API when the provider is OpenAI.
 
 ## Included systems and samples
 
@@ -127,6 +129,7 @@ Prompt-System.md    # Concept primer for systems of prompts
 ## Tips for authoring new systems
 
 - Keep prompts focused; lean on **structured outputs** and schema validation instead of long natural-language instructions.  
+- Specify **provider/model per node** (no global defaults) so batching and multi-model systems stay explicit.  
 - Use **input bindings** to pass only what each node needs, and prefer system inputs over re-querying the model.  
 - Add **routing conditions** for happy/sad paths and **loop controls** for controlled retries.  
 - Populate **descriptions** in system inputs/outputs to make `inspect` easier for others.  

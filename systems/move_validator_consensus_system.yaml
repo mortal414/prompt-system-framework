@@ -2,12 +2,7 @@ id: "move_validator_consensus_system"
 label: "Chess Move Validator (Dual-Path Consensus)"
 version: "0.1.0"
 entry_node_id: "normalize_input"
-
-provider_defaults:
-  openai:
-    model: "gpt-4o-mini"
-    temperature: 0.1
-    max_tokens: 640
+benchmark_batch_size: 100
 
 system_input:
   fields:
@@ -40,6 +35,10 @@ system_output:
 nodes:
   - id: "normalize_input"
     label: "Normalize board context"
+    provider: "openai"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 640
     instructions: |
       Translate the incoming system input into a normalized JSON summary that downstream nodes can reuse.
       Focus on: side to move, king safety notes, loose pieces, pawn structure, and any immediate tactical motifs.
@@ -89,6 +88,10 @@ nodes:
 
   - id: "path_alpha_validation"
     label: "Path Alpha – classical reasoning"
+    provider: "openai"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 640
     instructions: |
       You are Path Alpha, a classical chess arbiter.
       Use algebraic-chess terminology, highlight pins/pawns, and keep tone formal.
@@ -140,6 +143,10 @@ nodes:
 
   - id: "path_bravo_validation"
     label: "Path Bravo – spatial reasoning"
+    provider: "openai"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 640
     instructions: |
       You are Path Bravo, a spatial chess analyst describing geometry, squares, and attack rays in natural language.
       Use the normalized snapshot plus any disagreement context to double-check Path Alpha.
@@ -190,6 +197,10 @@ nodes:
 
   - id: "compare_paths"
     label: "Compare path verdicts"
+    provider: "openai"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 640
     instructions: |
       Compare Path Alpha and Path Bravo outputs.
       They agree only if both is_legal flags match.
@@ -239,6 +250,10 @@ nodes:
 
   - id: "handle_disagreement"
     label: "Disagreement handler"
+    provider: "openai"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 640
     instructions: |
       Summarize how Path Alpha and Path Bravo differed.
       Produce feedback that can be fed back into both paths, encouraging them to reconcile.
@@ -288,6 +303,10 @@ nodes:
 
   - id: "final_response"
     label: "Finalize consensus verdict"
+    provider: "openai"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 640
     instructions: |
       Produce the final answer for the user.
       If agreement was reached, celebrate the consensus and cite the blended reason.

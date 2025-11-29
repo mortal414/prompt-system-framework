@@ -8,7 +8,9 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List, Optional
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Callable, List, Optional
 
 import typer
 import yaml
@@ -18,6 +20,8 @@ from .engine import ExecutionEngine, ExecutionResult
 from .exceptions import ConfigError, ExecutionError
 from .logging import RunLogger
 from .models import SystemDef
+from .providers import get_provider
+from .providers.openai_provider import OpenAIBatchProvider
 
 app = typer.Typer(help="Prompt System Framework CLI")
 DEFAULT_RUN_DIR = "runs"
@@ -170,23 +174,30 @@ def benchmark(
     suite_root = run_root / "benchmarks" / benchmark_id
     suite_root.mkdir(parents=True, exist_ok=False)
     system_summaries: list[SystemBenchmarkSummary] = []
-    for system_arg in systems:
-        system_path = _resolve_path(system_arg)
-        system_def = _load_system_cli(system_path)
-        typer.echo(f"\n=== Benchmarking system: {system_def.id} ({system_def.label or 'unnamed'}) ===")
-        summary = _run_benchmark_for_system(
-            system_def=system_def,
-            system_path=system_path,
-            scenarios=scenarios,
-            iterations=iterations,
-            output_field=output_field,
-            suite_root=suite_root,
-            benchmark_id=benchmark_id,
-            expect_field=expect_field,
-        )
-        system_summaries.append(summary)
-        _print_benchmark_summary(summary.scenario_results, summary.summary_path)
-        typer.echo(f"Artifacts stored under: {summary.benchmark_root}")
+    # Run systems in parallel so benchmarks don't block on each other.
+    with ThreadPoolExecutor(max_workers=max(1, len(systems))) as executor:
+        future_map = {}
+        for system_arg in systems:
+            system_path = _resolve_path(system_arg)
+            system_def = _load_system_cli(system_path)
+            typer.echo(f"\n=== Benchmarking system: {system_def.id} ({system_def.label or 'unnamed'}) ===")
+            future = executor.submit(
+                _run_benchmark_for_system,
+                system_def=system_def,
+                system_path=system_path,
+                scenarios=scenarios,
+                iterations=iterations,
+                output_field=output_field,
+                suite_root=suite_root,
+                benchmark_id=benchmark_id,
+                expect_field=expect_field,
+            )
+            future_map[future] = system_def
+        for future in future_map:
+            summary = future.result()
+            system_summaries.append(summary)
+            _print_benchmark_summary(summary.scenario_results, summary.summary_path)
+            typer.echo(f"Artifacts stored under: {summary.benchmark_root}")
     suite_summary_path = suite_root / "suite_summary.json"
     _write_suite_summary(
         suite_summary_path,
@@ -345,27 +356,46 @@ def _load_benchmark_scenarios(paths: list[Path], expect_field: str) -> list[Benc
     return scenarios
 
 
-def _run_benchmark_for_scenario(
-    engine: ExecutionEngine,
-    system: SystemDef,
-    scenario: BenchmarkScenario,
+def _run_benchmark_for_system(
+    *,
+    system_def: SystemDef,
+    system_path: Path,
+    scenarios: List[BenchmarkScenario],
     iterations: int,
     output_field: str,
-    benchmark_root: Path,
+    suite_root: Path,
     benchmark_id: str,
-    system_path: Path,
-) -> BenchmarkResult:
-    iteration_records: list[BenchmarkIterationRecord] = []
-    successes = 0
-    scenario_slug = _sanitize_name(scenario.name)
-    for idx in range(iterations):
+    expect_field: str,
+) -> SystemBenchmarkSummary:
+    benchmark_root = suite_root / system_def.id
+    benchmark_root.mkdir(parents=True, exist_ok=False)
+    started_at = datetime.now(timezone.utc)
+    batch_size = max(1, system_def.benchmark_batch_size or 1)
+    use_batch = batch_size > 1
+    batch_provider: OpenAIBatchProvider | None = None
+    if use_batch:
+        batch_provider = OpenAIBatchProvider(batch_size=batch_size)
+
+    def _provider_resolver(name: str):
+        if use_batch and name == "openai" and batch_provider is not None:
+            return batch_provider
+        return get_provider(name)
+
+    iteration_results: dict[str, list[BenchmarkIterationRecord]] = defaultdict(list)
+    scenario_expected_map = {s.name: s.expected_label for s in scenarios}
+    successes: dict[str, int] = defaultdict(int)
+    futures = []
+
+    def _execute_iteration(scenario: BenchmarkScenario, iteration_index: int) -> tuple[str, BenchmarkIterationRecord]:
         payload = copy.deepcopy(scenario.payload)
-        run_id = f"{benchmark_id}-{scenario_slug}-{idx + 1:03d}"
-        run_logger = RunLogger(benchmark_root, system, run_id=run_id, use_system_subdir=False)
+        scenario_slug = _sanitize_name(scenario.name)
+        run_id = f"{benchmark_id}-{scenario_slug}-{iteration_index:03d}"
+        run_logger = RunLogger(benchmark_root, system_def, run_id=run_id, use_system_subdir=False)
         run_logger.snapshot_system()
         run_logger.snapshot_input(payload)
         try:
-            result = engine.run(payload)
+            local_engine = ExecutionEngine(system_def, provider_resolver=_provider_resolver)
+            result = local_engine.run(payload)
         except ExecutionError as exc:  # pragma: no cover - network/provider errors
             result = ExecutionResult(
                 status="failure",
@@ -378,6 +408,7 @@ def _run_benchmark_for_scenario(
         for record in result.node_results:
             run_logger.log_node(record)
         run_logger.finalize(result, config_path=system_path)
+
         iteration_status = "success"
         actual_label: Optional[str] = None
         detail: Optional[str] = None
@@ -401,57 +432,44 @@ def _run_benchmark_for_scenario(
                     detail = str(exc)
                 else:
                     if actual_bool == scenario.expected_bool:
-                        successes += 1
                         detail = final_output.get("reason")
                     else:
                         iteration_status = "mismatch"
                         detail = final_output.get("reason") or "mismatched legality"
-        iteration_records.append(
-            BenchmarkIterationRecord(
-                iteration=idx + 1,
-                run_dir=str(run_logger.run_dir),
-                expected_label=scenario.expected_label,
-                actual_label=actual_label,
-                status=iteration_status,
-                detail=detail,
-            )
+        return scenario.name, BenchmarkIterationRecord(
+            iteration=iteration_index,
+            run_dir=str(run_logger.run_dir),
+            expected_label=scenario.expected_label,
+            actual_label=actual_label,
+            status=iteration_status,
+            detail=detail,
         )
-    return BenchmarkResult(
-        scenario=scenario,
-        total_runs=iterations,
-        successes=successes,
-        iterations=iteration_records,
-    )
 
+    max_workers = max(batch_size, 4)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for scenario in scenarios:
+            for idx in range(iterations):
+                futures.append(executor.submit(_execute_iteration, scenario, idx + 1))
+        for future in as_completed(futures):
+            scenario_name, record = future.result()
+            iteration_results[scenario_name].append(record)
+            if record.status == "success":
+                scenario_expected = scenario_expected_map.get(scenario_name)
+                if scenario_expected and record.actual_label == scenario_expected:
+                    successes[scenario_name] += 1
 
-def _run_benchmark_for_system(
-    *,
-    system_def: SystemDef,
-    system_path: Path,
-    scenarios: List[BenchmarkScenario],
-    iterations: int,
-    output_field: str,
-    suite_root: Path,
-    benchmark_id: str,
-    expect_field: str,
-) -> SystemBenchmarkSummary:
-    engine = ExecutionEngine(system_def)
-    benchmark_root = suite_root / system_def.id
-    benchmark_root.mkdir(parents=True, exist_ok=False)
-    started_at = datetime.now(timezone.utc)
     scenario_results: list[BenchmarkResult] = []
     for scenario in scenarios:
-        result = _run_benchmark_for_scenario(
-            engine=engine,
-            system=system_def,
-            scenario=scenario,
-            iterations=iterations,
-            output_field=output_field,
-            benchmark_root=benchmark_root,
-            benchmark_id=benchmark_id,
-            system_path=system_path,
+        records = iteration_results.get(scenario.name, [])
+        records.sort(key=lambda r: r.iteration)
+        scenario_results.append(
+            BenchmarkResult(
+                scenario=scenario,
+                total_runs=iterations,
+                successes=successes.get(scenario.name, 0),
+                iterations=records,
+            )
         )
-        scenario_results.append(result)
     finished_at = datetime.now(timezone.utc)
     summary_path = benchmark_root / "benchmark_summary.json"
     _write_benchmark_summary(

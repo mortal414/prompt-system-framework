@@ -90,6 +90,7 @@ class NodeDef(BaseModel):
     model: Optional[str] = None
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
+    extra_params: Dict[str, Any] = Field(default_factory=dict)
     instructions: str
     prompt_template: str
     input_bindings: Dict[str, InputBinding] = Field(default_factory=dict)
@@ -114,16 +115,24 @@ class NodeDef(BaseModel):
             raise ValueError("prompt_template must not be empty")
         return self
 
+    @model_validator(mode="after")
+    def _ensure_model(self) -> "NodeDef":
+        if not self.model:
+            raise ValueError("node must specify a model")
+        if not self.provider:
+            self.provider = "openai"
+        return self
+
 
 class SystemDef(BaseModel):
     id: str
     label: Optional[str] = None
     version: Optional[str] = None
     entry_node_id: str
-    provider_defaults: Dict[str, ModelConfig] = Field(default_factory=dict)
     system_input: SystemInputConfig = Field(default_factory=SystemInputConfig)
     system_output: SystemOutputConfig
     nodes: List[NodeDef]
+    benchmark_batch_size: int = Field(default=1, ge=1)
 
     @model_validator(mode="after")
     def _validate_structure(self) -> "SystemDef":

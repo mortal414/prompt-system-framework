@@ -2,12 +2,7 @@ id: "move_validator_simple_system"
 label: "Chess Move Validator (Single Pass)"
 version: "0.1.0"
 entry_node_id: "quick_legality_check"
-
-provider_defaults:
-  openai:
-    model: "gpt-4o-mini"
-    temperature: 0.0
-    max_tokens: 256
+benchmark_batch_size: 100
 
 system_input:
   fields:
@@ -38,6 +33,10 @@ system_output:
 nodes:
   - id: "quick_legality_check"
     label: "Single-pass legality question"
+    provider: "openai"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 256
     instructions: |
       You are a concise chess arbiter answering whether a single move is legal.
       Respond with plain text in two short sentences: first sentence must be either "Legal" or "Illegal" followed by a colon and justification; second sentence should name any rules that apply.
@@ -62,6 +61,10 @@ nodes:
 
   - id: "format_legality"
     label: "Format quick decision"
+    provider: "openai"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 256
     instructions: |
       Turn the raw text into structured JSON.
       If the first sentence begins with "Legal", set is_legal=true.
