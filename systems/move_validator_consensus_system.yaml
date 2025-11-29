@@ -298,6 +298,15 @@ nodes:
       Selected reason: {{ compare_reason | default("(none)") }}
       Disagreement summary: {{ disagreement_summary | default("(none)") }}
       Total disagreements: {{ disagreement_count | default(0) }}
+
+      Respond with minified JSON only:
+      {
+        "is_legal": true|false,
+        "reason": "<short justification>",
+        "confidence": <number 0-1>,
+        "message": "<one-line user-facing verdict>",
+        "disagreement_count": <integer>
+      }
     input_bindings:
       agree:
         from: "node.compare_paths.output.agree"
@@ -329,5 +338,5 @@ nodes:
           type: string
         disagreement_count:
           type: integer
-      required: [reason, message]
+      required: [is_legal, reason, message]
     terminal: true
