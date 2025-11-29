@@ -98,7 +98,7 @@ nodes:
      --expect-field expected_legality \
      --output-field is_legal
    ```
-   Per-system summaries live at `runs/<system_id>/benchmarks/<benchmark_id>/`; a cross-system suite report is written to `runs/benchmarks/<benchmark_id>/suite_summary.json`.
+   Each benchmark run is grouped under `runs/benchmarks/<benchmark_id>/` with per-system artifacts in subfolders (e.g., `runs/benchmarks/<benchmark_id>/move_validator_system/`) and a cross-system suite report at `runs/benchmarks/<benchmark_id>/suite_summary.json`.
 
 ## Included systems and samples
 

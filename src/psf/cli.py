@@ -180,7 +180,7 @@ def benchmark(
             scenarios=scenarios,
             iterations=iterations,
             output_field=output_field,
-            run_root=run_root,
+            suite_root=suite_root,
             benchmark_id=benchmark_id,
             expect_field=expect_field,
         )
@@ -431,12 +431,12 @@ def _run_benchmark_for_system(
     scenarios: List[BenchmarkScenario],
     iterations: int,
     output_field: str,
-    run_root: Path,
+    suite_root: Path,
     benchmark_id: str,
     expect_field: str,
 ) -> SystemBenchmarkSummary:
     engine = ExecutionEngine(system_def)
-    benchmark_root = run_root / system_def.id / "benchmarks" / benchmark_id
+    benchmark_root = suite_root / system_def.id
     benchmark_root.mkdir(parents=True, exist_ok=False)
     started_at = datetime.now(timezone.utc)
     scenario_results: list[BenchmarkResult] = []
