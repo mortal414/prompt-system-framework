@@ -1,0 +1,342 @@
+id: "chess_uci_move_generator_validated_system_clean"
+label: "Chess Move Generator (UCI, Self-Validated)"
+version: "0.1.0"
+entry_node_id: "propose_move"
+benchmark_batch_size: 25
+
+system_input:
+  fields:
+    position_fen:
+      type: string
+      required: true
+      description: "Board state in Forsyth–Edwards Notation (full FEN, 6 fields)"
+    move_notation:
+      type: string
+      required: false
+      description: "Move notation tag (uci)"
+    move_context:
+      type: string
+      required: false
+      description: "Optional human notes or intent"
+
+system_output:
+  fields:
+    move_uci:
+      from: "node.final_response.output.move_uci"
+    trusted_by_validator:
+      from: "node.final_response.output.trusted_by_validator"
+    illegal_attempts:
+      from: "node.final_response.output.illegal_attempts"
+    illegal_moves:
+      from: "node.final_response.output.illegal_moves"
+
+nodes:
+  - id: "propose_move"
+    label: "Generate one UCI move"
+    provider: "openai"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 256
+    max_retries: 2
+    instructions: |
+      You are playing a chess game and must propose exactly ONE legal move for the side to move.
+      Move notation: UCI (coordinate notation).
+
+      UCI format:
+      - Normal move: <from><to> (example: e2e4).
+      - Promotion: add one letter (q, r, b, n) in lowercase (example: e7e8q).
+      - Castling is the king move: e1g1, e1c1, e8g8, e8c8.
+      - Use lowercase for squares and promotion piece; do not include SAN symbols (no "x", "+", "#", "=", or "O-O").
+
+      Requirements:
+      - The move must be legal in the exact position (respect side to move, check, pins, castling rights, en passant, promotion).
+      - Output must be minified JSON only (no markdown, no code fences).
+      - The JSON key must be "move_uci".
+      - Do not output any move listed under Illegal moves.
+      - Output exactly one UCI move string with no surrounding whitespace.
+      - The UCI move string must be length 4 (normal) or 5 (promotion).
+      - If unsure, prefer a quiet developing move, but it still must be legal.
+    prompt_template: |
+      FEN: {{ position_fen }}
+      Side to move: {{ "white" if position_fen.split(" ")[1] == "w" else "black" }}
+      Move notation: UCI
+      Attempt: {{ illegal_attempts + 1 }}
+      {% if move_context %}
+      Context: {{ move_context }}
+      {% endif %}
+      {% if illegal_moves and illegal_moves|length > 0 %}
+      Illegal moves (do not repeat):
+      {% for m in illegal_moves %}
+      - {{ m }}
+      {% endfor %}
+      {% endif %}
+      {% if last_illegal_reason %}
+      Last rejection note: {{ last_illegal_reason }}
+      {% endif %}
+
+      Respond with minified JSON only:
+      {"move_uci":"<UCI move>"}
+    input_bindings:
+      position_fen:
+        from: "system.position_fen"
+      move_context:
+        from: "system.move_context"
+        required: false
+      illegal_moves:
+        from: "node.handle_illegal_move.output.illegal_moves"
+        required: false
+        default: []
+      illegal_attempts:
+        from: "runtime.loop_counters.illegal_move_attempts"
+        required: false
+        default: 0
+      last_illegal_reason:
+        from: "node.parse_legality_yn.output.reason"
+        required: false
+        default: ""
+    output_mode: "structured"
+    output_schema:
+      type: object
+      properties:
+        move_uci:
+          type: string
+      required: [move_uci]
+    routing:
+      on_success:
+        - next: "ask_legality_yn"
+
+  - id: "ask_legality_yn"
+    label: "Validate UCI legality (Y/N)"
+    provider: "openai"
+    model: "gpt-4o"
+    temperature: 0.0
+    max_tokens: 32
+    max_retries: 2
+    instructions: |
+      You are a strict chess arbiter.
+      Determine if the candidate move is legal in the exact position provided.
+      The move is in UCI notation (e.g. e2e4, e7e8q, e1g1).
+      Reply with exactly one character: "Y" (legal) or "N" (illegal). No other text.
+    prompt_template: |
+      FEN: {{ position_fen }}
+      MOVE (UCI): {{ candidate_move }}
+
+      Is the move legal given the game state? (Y/N)
+    input_bindings:
+      position_fen:
+        from: "system.position_fen"
+      candidate_move:
+        from: "node.propose_move.output.move_uci"
+      move_context:
+        from: "system.move_context"
+        required: false
+    output_mode: "raw"
+    routing:
+      on_success:
+        - next: "parse_legality_yn"
+
+  - id: "parse_legality_yn"
+    label: "Parse Y/N verdict"
+    provider: "openai"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 128
+    max_retries: 2
+    instructions: |
+      Convert the raw verdict into strict JSON.
+      Rules:
+      - If the first non-whitespace token starts with "Y" (e.g. "Y", "Yes"), is_legal=true and verdict="Y".
+      - If it starts with "N" (e.g. "N", "No"), is_legal=false and verdict="N".
+      - If it starts with "L" (e.g. "Legal"), is_legal=true and verdict="Y".
+      - If it starts with "I" (e.g. "Illegal"), is_legal=false and verdict="N".
+      - Otherwise, is_legal=false and verdict="N".
+      - reason must be a short, neutral phrase (do not restate the full position).
+    prompt_template: |
+      Raw verdict:
+      {{ raw_verdict }}
+
+      Respond with minified JSON:
+      {
+        "is_legal": true|false,
+        "verdict": "Y"|"N",
+        "reason": "<short phrase>"
+      }
+    input_bindings:
+      raw_verdict:
+        from: "node.ask_legality_yn.raw_output"
+    output_mode: "structured"
+    output_schema:
+      type: object
+      properties:
+        is_legal:
+          type: boolean
+        verdict:
+          type: string
+          enum: ["Y", "N"]
+        reason:
+          type: string
+      required: [is_legal, verdict, reason]
+    routing:
+      on_success:
+        - condition: "output.is_legal == true"
+          next: "final_response"
+        - condition: "output.is_legal == false"
+          next: "handle_illegal_move"
+
+  - id: "handle_illegal_move"
+    label: "Accumulate illegal moves and retry"
+    provider: "openai"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 256
+    max_retries: 2
+    instructions: |
+      Maintain a running list of illegal move attempts.
+      Append the current move to the prior list, preserving order.
+      Output minified JSON only.
+    prompt_template: |
+      Prior illegal moves: {{ prior_illegal_moves }}
+      New illegal move to append: {{ new_illegal_move }}
+      Why it was rejected: {{ reason }}
+
+      Respond with minified JSON only:
+      {"illegal_moves":["..."]}
+    input_bindings:
+      prior_illegal_moves:
+        from: "node.handle_illegal_move.output.illegal_moves"
+        required: false
+        default: []
+      new_illegal_move:
+        from: "node.propose_move.output.move_uci"
+      reason:
+        from: "node.parse_legality_yn.output.reason"
+        required: false
+        default: ""
+    output_mode: "structured"
+    output_schema:
+      type: object
+      properties:
+        illegal_moves:
+          type: array
+          items:
+            type: string
+      required: [illegal_moves]
+    loop_control:
+      counter_key: "illegal_move_attempts"
+      max_iterations: 5
+      loop_target_node: "propose_move"
+      exit_on_success: false
+    routing:
+      on_loop_exhausted:
+        - next: "force_accept_move"
+
+  - id: "force_accept_move"
+    label: "Generate final move (force accept)"
+    provider: "openai"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 256
+    max_retries: 2
+    instructions: |
+      You already produced 5 illegal move attempts.
+      Propose ONE move in UCI anyway; it does NOT need to be legal, but try your best.
+      Output must be minified JSON only with key "move_uci".
+      Do not repeat moves listed under Illegal moves.
+      Still follow UCI formatting (4 chars, or 5 with promotion; lowercase).
+    prompt_template: |
+      FEN: {{ position_fen }}
+      Side to move: {{ "white" if position_fen.split(" ")[1] == "w" else "black" }}
+      Move notation: UCI
+      Attempts so far (illegal): {{ illegal_attempts }}
+      {% if move_context %}
+      Context: {{ move_context }}
+      {% endif %}
+      Illegal moves (do not repeat):
+      {% for m in illegal_moves %}
+      - {{ m }}
+      {% endfor %}
+
+      Respond with minified JSON only:
+      {"move_uci":"<UCI move>"}
+    input_bindings:
+      position_fen:
+        from: "system.position_fen"
+      move_context:
+        from: "system.move_context"
+        required: false
+      illegal_moves:
+        from: "node.handle_illegal_move.output.illegal_moves"
+        required: false
+        default: []
+      illegal_attempts:
+        from: "runtime.loop_counters.illegal_move_attempts"
+        required: false
+        default: 5
+    output_mode: "structured"
+    output_schema:
+      type: object
+      properties:
+        move_uci:
+          type: string
+      required: [move_uci]
+    routing:
+      on_success:
+        - next: "final_response"
+
+  - id: "final_response"
+    label: "Finalize move selection"
+    provider: "openai"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 256
+    max_retries: 2
+    instructions: |
+      Produce the final system output.
+      If a move was accepted as legal by the validator, trusted_by_validator must be true.
+      If we exhausted illegal retries and had to force-accept a move, trusted_by_validator must be false.
+      Output minified JSON only.
+    prompt_template: |
+      Candidate from validated path: {{ validated_move }}
+      Candidate from forced path: {{ forced_move }}
+      Illegal attempts: {{ illegal_attempts }}
+      Illegal moves: {{ illegal_moves }}
+
+      Rules:
+      - If forced_move is non-empty, output forced_move and trusted_by_validator=false.
+      - Else output validated_move and trusted_by_validator=true.
+
+      Respond with minified JSON only:
+      {"move_uci":"...","trusted_by_validator":true,"illegal_attempts":0,"illegal_moves":["..."]}
+    input_bindings:
+      validated_move:
+        from: "node.propose_move.output.move_uci"
+        required: false
+        default: ""
+      forced_move:
+        from: "node.force_accept_move.output.move_uci"
+        required: false
+        default: ""
+      illegal_attempts:
+        from: "runtime.loop_counters.illegal_move_attempts"
+        required: false
+        default: 0
+      illegal_moves:
+        from: "node.handle_illegal_move.output.illegal_moves"
+        required: false
+        default: []
+    output_mode: "structured"
+    output_schema:
+      type: object
+      properties:
+        move_uci:
+          type: string
+        trusted_by_validator:
+          type: boolean
+        illegal_attempts:
+          type: number
+        illegal_moves:
+          type: array
+          items:
+            type: string
+      required: [move_uci, trusted_by_validator, illegal_attempts, illegal_moves]
+    terminal: true

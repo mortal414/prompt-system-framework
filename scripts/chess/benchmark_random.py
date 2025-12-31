@@ -6,10 +6,11 @@ import logging
 import random
 import secrets
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import chess
 
@@ -19,6 +20,8 @@ from psf.engine import ExecutionEngine, ExecutionResult
 from psf.exceptions import ExecutionError
 from psf.logging import RunLogger
 from psf.models import SystemDef
+from psf.providers import get_provider
+from psf.providers.openai_provider import OpenAIBatchProvider
 
 
 @dataclass(frozen=True)
@@ -34,15 +37,26 @@ class RunArtifacts:
 class GeneratorSystem:
     system_path: Path
     system_def: SystemDef
-    engine: ExecutionEngine
+    move_notation: str
+    move_output_field: str
 
 
 @dataclass(frozen=True)
 class ValidatorSystem:
     system_path: Path
     system_def: SystemDef
-    engine: ExecutionEngine
     move_notation: str
+
+
+@dataclass(frozen=True)
+class PositionOutcome:
+    index: int
+    record: dict[str, Any]
+    token_totals: dict[str, int]
+    validator_baseline: dict[str, dict[str, int]]
+    generator: dict[str, dict[str, int]]
+    validator_on_generator: dict[str, dict[str, int]]
+    pipeline: dict[str, int]
 
 
 def _setup_logging(*, level: str, log_file: Path | None) -> logging.Logger:
@@ -107,19 +121,20 @@ def _oracle_uci_legality(*, fen: str, move_uci: str) -> tuple[bool, Optional[str
 
 def _execute_with_run_logger(
     *,
-    engine: ExecutionEngine,
     system_def: SystemDef,
     system_path: Path,
     payload: dict[str, Any],
     runs_root: Path,
     run_id: str,
+    provider_resolver: Callable[[str], Any] | None = None,
 ) -> RunArtifacts:
     runs_root.mkdir(parents=True, exist_ok=True)
     run_logger = RunLogger(runs_root, system_def, run_id=run_id, use_system_subdir=False)
     run_logger.snapshot_system()
     run_logger.snapshot_input(payload)
     try:
-        result = engine.run(payload)
+        local_engine = ExecutionEngine(system_def, provider_resolver=provider_resolver)
+        result = local_engine.run(payload)
     except ExecutionError as exc:
         result = ExecutionResult(
             status="failure",
@@ -153,18 +168,38 @@ def _coerce_bool(value: Any) -> bool:
     raise ValueError("expected a boolean-like label (legal/illegal, true/false, 1/0)")
 
 
-def _load_system(path: Path) -> tuple[SystemDef, ExecutionEngine]:
-    system_def = load_system_definition(path)
-    return system_def, ExecutionEngine(system_def)
+def _load_system(path: Path) -> SystemDef:
+    return load_system_definition(path)
 
 
 def _infer_move_notation(*, system_def: SystemDef, system_path: Path, default: str) -> str:
+    try:
+        output_fields = set(system_def.system_output.fields.keys())
+    except Exception:
+        output_fields = set()
+    if "move_uci" in output_fields and "move_san" not in output_fields:
+        return "uci"
+    if "move_san" in output_fields and "move_uci" not in output_fields:
+        return "san"
     haystack = f"{system_def.id} {system_path.name}".lower()
     if "uci" in haystack:
         return "uci"
     if "san" in haystack:
         return "san"
     return default
+
+
+def _infer_move_output_field(*, system_def: SystemDef, preferred_field: str) -> str:
+    fields = set(system_def.system_output.fields.keys())
+    if preferred_field in fields:
+        return preferred_field
+    for candidate in ("move", "move_san", "move_uci"):
+        if candidate in fields:
+            return candidate
+    move_like = sorted(name for name in fields if name.startswith("move"))
+    if len(move_like) == 1:
+        return move_like[0]
+    return preferred_field
 
 
 def main() -> None:
@@ -192,7 +227,7 @@ def main() -> None:
         "--generator-output-field",
         type=str,
         default="move_san",
-        help="System output field containing the generated SAN move",
+        help="System output field containing the generated move (SAN or UCI)",
     )
     parser.add_argument(
         "--validator-system",
@@ -237,6 +272,35 @@ def main() -> None:
         default=10,
         help="Log progress every N positions (0 disables)",
     )
+    parser.add_argument(
+        "--openai-batch",
+        action="store_true",
+        help="Use OpenAI Batch API for model calls (requires OpenAI provider).",
+    )
+    parser.add_argument(
+        "--openai-batch-size",
+        type=int,
+        default=None,
+        help="Requests per OpenAI batch job (default: max of system benchmark_batch_size).",
+    )
+    parser.add_argument(
+        "--openai-batch-max-wait",
+        type=float,
+        default=0.5,
+        help="Max seconds to wait to fill a batch before flushing.",
+    )
+    parser.add_argument(
+        "--openai-batch-poll-interval",
+        type=float,
+        default=1.0,
+        help="Poll interval (seconds) while waiting for a batch job to complete.",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=0,
+        help="Worker threads when --openai-batch is enabled (0=auto).",
+    )
     args = parser.parse_args()
 
     if args.iterations < 1:
@@ -251,6 +315,14 @@ def main() -> None:
         raise SystemExit("--illegal-ratio must be between 0 and 1")
     if not args.generator_system and not args.validator_system:
         raise SystemExit("Provide at least one of --generator-system or --validator-system")
+    if args.openai_batch_size is not None and args.openai_batch_size < 2:
+        raise SystemExit("--openai-batch-size must be >= 2 (or omit for auto)")
+    if args.openai_batch_max_wait <= 0:
+        raise SystemExit("--openai-batch-max-wait must be > 0")
+    if args.openai_batch_poll_interval <= 0:
+        raise SystemExit("--openai-batch-poll-interval must be > 0")
+    if args.max_workers < 0:
+        raise SystemExit("--max-workers must be >= 0")
 
     run_root: Path = args.run_dir.expanduser().resolve()
     benchmark_id = _generate_benchmark_id()
@@ -268,17 +340,47 @@ def main() -> None:
     generator_systems: list[GeneratorSystem] = []
     for path in args.generator_system:
         resolved = path.expanduser().resolve()
-        system_def, engine = _load_system(resolved)
-        generator_systems.append(GeneratorSystem(system_path=resolved, system_def=system_def, engine=engine))
+        system_def = _load_system(resolved)
+        notation = _infer_move_notation(system_def=system_def, system_path=resolved, default="san")
+        move_output_field = _infer_move_output_field(system_def=system_def, preferred_field=args.generator_output_field)
+        generator_systems.append(
+            GeneratorSystem(
+                system_path=resolved,
+                system_def=system_def,
+                move_notation=notation,
+                move_output_field=move_output_field,
+            )
+        )
 
     validator_systems: list[ValidatorSystem] = []
     for path in args.validator_system:
         resolved = path.expanduser().resolve()
-        system_def, engine = _load_system(resolved)
+        system_def = _load_system(resolved)
         notation = _infer_move_notation(system_def=system_def, system_path=resolved, default="san")
         validator_systems.append(
-            ValidatorSystem(system_path=resolved, system_def=system_def, engine=engine, move_notation=notation)
+            ValidatorSystem(system_path=resolved, system_def=system_def, move_notation=notation)
         )
+
+    openai_batch_provider: OpenAIBatchProvider | None = None
+    openai_batch_size: int | None = None
+    max_workers = 1
+    if args.openai_batch:
+        configured_sizes: list[int] = []
+        for system in [*generator_systems, *validator_systems]:
+            configured_sizes.append(int(getattr(system.system_def, "benchmark_batch_size", 1) or 1))
+        inferred_size = max(configured_sizes) if configured_sizes else 2
+        openai_batch_size = int(args.openai_batch_size or max(2, inferred_size))
+        max_workers = int(args.max_workers) if args.max_workers else max(openai_batch_size, 4)
+        openai_batch_provider = OpenAIBatchProvider(
+            batch_size=openai_batch_size,
+            max_wait_seconds=float(args.openai_batch_max_wait),
+            poll_interval_seconds=float(args.openai_batch_poll_interval),
+        )
+
+    def _provider_resolver(name: str) -> Any:
+        if openai_batch_provider is not None and name == "openai":
+            return openai_batch_provider
+        return get_provider(name)
 
     manifest = {
         "benchmark_id": benchmark_id,
@@ -289,7 +391,13 @@ def main() -> None:
         "illegal_ratio": args.illegal_ratio,
         "pipeline_max_attempts": args.pipeline_max_attempts,
         "generator_systems": [
-            {"path": str(s.system_path), "id": s.system_def.id, "label": s.system_def.label}
+            {
+                "path": str(s.system_path),
+                "id": s.system_def.id,
+                "label": s.system_def.label,
+                "move_notation": s.move_notation,
+                "move_output_field": s.move_output_field,
+            }
             for s in generator_systems
         ],
         "validator_systems": [
@@ -301,6 +409,13 @@ def main() -> None:
             }
             for s in validator_systems
         ],
+        "openai_batch": {
+            "enabled": bool(openai_batch_provider is not None),
+            "batch_size": openai_batch_size,
+            "max_wait_seconds": float(args.openai_batch_max_wait),
+            "poll_interval_seconds": float(args.openai_batch_poll_interval),
+            "max_workers": max_workers,
+        },
         "started_at": datetime.now(timezone.utc).isoformat(),
         "artifacts": {
             "positions": "positions.jsonl",
@@ -319,16 +434,54 @@ def main() -> None:
     logger.info("Benchmark: %s", benchmark_id)
     logger.info("Positions: %s | plies=%s | seed=%s", args.iterations, args.plies, args.seed)
     if generator_systems:
-        logger.info("Generators: %s", ", ".join(s.system_def.id for s in generator_systems))
+        logger.info(
+            "Generators: %s",
+            ", ".join(f"{s.system_def.id}({s.move_notation},{s.move_output_field})" for s in generator_systems),
+        )
     if validator_systems:
         logger.info(
             "Validators: %s",
             ", ".join(f"{s.system_def.id}({s.move_notation})" for s in validator_systems),
         )
+    if openai_batch_provider is not None:
+        logger.info(
+            "OpenAI batch enabled: batch_size=%s max_workers=%s max_wait=%.2fs poll_interval=%.2fs",
+            openai_batch_size,
+            max_workers,
+            float(args.openai_batch_max_wait),
+            float(args.openai_batch_poll_interval),
+        )
     logger.info("Artifacts: %s", benchmark_dir)
 
     pos_rng = random.Random(args.seed)
     case_rng = random.Random(args.seed + 1)
+
+    positions: list[GeneratedPosition] = []
+    baseline_candidates: dict[int, tuple[str, str]] = {}
+    for index in range(1, args.iterations + 1):
+        position = play_random_plies(plies=args.plies, rng=pos_rng)
+        positions.append(position)
+        _append_jsonl(
+            positions_path,
+            {
+                "index": index,
+                "position_fen": position.fen,
+                "move_history_san": position.move_history_san,
+                "move_history_uci": position.move_history_uci,
+            },
+        )
+        if validator_systems:
+            board = chess.Board(position.fen)
+            want_illegal = case_rng.random() < args.illegal_ratio
+            if want_illegal:
+                candidate_san = generate_illegal_san(board, case_rng)
+                candidate_uci = generate_illegal_uci(board, case_rng)
+            else:
+                legal_moves = list(board.legal_moves)
+                chosen = case_rng.choice(legal_moves)
+                candidate_san = board.san(chosen)
+                candidate_uci = chosen.uci()
+            baseline_candidates[index] = (candidate_san, candidate_uci)
 
     # Aggregates
     validator_baseline: dict[str, dict[str, int]] = {
@@ -356,21 +509,50 @@ def main() -> None:
 
     token_totals: dict[str, int] = {}
 
-    pipeline_enabled = len(generator_systems) == 1 and len(validator_systems) == 1
-    if (generator_systems and validator_systems) and not pipeline_enabled:
-        logger.info("Pipeline mode disabled (requires exactly 1 generator and 1 validator).")
+    pipeline_enabled = (
+        len(generator_systems) == 1
+        and len(validator_systems) == 1
+        and generator_systems[0].move_notation == validator_systems[0].move_notation
+    )
+    if generator_systems and validator_systems and not pipeline_enabled:
+        if len(generator_systems) != 1 or len(validator_systems) != 1:
+            logger.info("Pipeline mode disabled (requires exactly 1 generator and 1 validator).")
+        else:
+            logger.info(
+                "Pipeline mode disabled (generator notation=%s, validator notation=%s).",
+                generator_systems[0].move_notation,
+                validator_systems[0].move_notation,
+            )
 
-    for index in range(1, args.iterations + 1):
-        position: GeneratedPosition = play_random_plies(plies=args.plies, rng=pos_rng)
-        _append_jsonl(
-            positions_path,
-            {
-                "index": index,
-                "position_fen": position.fen,
-                "move_history_san": position.move_history_san,
-                "move_history_uci": position.move_history_uci,
-            },
-        )
+    def _oracle_legality(*, fen: str, move: str, notation: str) -> tuple[bool, Optional[str]]:
+        if notation == "uci":
+            return _oracle_uci_legality(fen=fen, move_uci=move)
+        return _oracle_san_legality(fen=fen, move_san=move)
+
+    def _merge_nested_counts(target: dict[str, dict[str, int]], inc: dict[str, dict[str, int]]) -> None:
+        for system_id, stats in inc.items():
+            bucket = target.setdefault(system_id, {})
+            for key, value in stats.items():
+                bucket[key] = bucket.get(key, 0) + int(value)
+
+    def _merge_token_totals(target: dict[str, int], inc: dict[str, int]) -> None:
+        for system_id, value in inc.items():
+            target[system_id] = target.get(system_id, 0) + int(value)
+
+    def _evaluate_position(index: int, position: GeneratedPosition) -> PositionOutcome:
+        local_token_totals: dict[str, int] = {}
+        local_validator_baseline: dict[str, dict[str, int]] = {}
+        local_generator: dict[str, dict[str, int]] = {}
+        local_validator_on_generator: dict[str, dict[str, int]] = {}
+        local_pipeline: dict[str, int] = {
+            "total": 0,
+            "accepts": 0,
+            "rejects": 0,
+            "errors": 0,
+            "false_accepts": 0,
+            "oracle_legal_accepts": 0,
+            "total_attempts": 0,
+        }
 
         record: dict[str, Any] = {
             "index": index,
@@ -383,32 +565,17 @@ def main() -> None:
 
         # --- Validator baseline on random labeled moves (optional) ---
         if validator_systems:
-            board = chess.Board(position.fen)
-            want_illegal = case_rng.random() < args.illegal_ratio
-            if want_illegal:
-                candidate_san = generate_illegal_san(board, case_rng)
-                candidate_uci = generate_illegal_uci(board, case_rng)
-            else:
-                legal_moves = list(board.legal_moves)
-                chosen = case_rng.choice(legal_moves)
-                candidate_san = board.san(chosen)
-                candidate_uci = chosen.uci()
-
+            candidate_san, candidate_uci = baseline_candidates[index]
             record["validator_baseline"] = {}
             for validator in validator_systems:
-                if validator.move_notation == "uci":
-                    candidate_move = candidate_uci
-                    expected_is_legal, expected_error = _oracle_uci_legality(
-                        fen=position.fen, move_uci=candidate_move
-                    )
-                else:
-                    candidate_move = candidate_san
-                    expected_is_legal, expected_error = _oracle_san_legality(
-                        fen=position.fen, move_san=candidate_move
-                    )
+                candidate_move = candidate_uci if validator.move_notation == "uci" else candidate_san
+                expected_is_legal, expected_error = _oracle_legality(
+                    fen=position.fen, move=candidate_move, notation=validator.move_notation
+                )
                 expected_legality = "legal" if expected_is_legal else "illegal"
 
-                validator_baseline[validator.system_def.id]["total"] += 1
+                local_validator_baseline.setdefault(validator.system_def.id, {"total": 0, "correct": 0, "errors": 0})
+                local_validator_baseline[validator.system_def.id]["total"] += 1
                 payload = {
                     "position_fen": position.fen,
                     "candidate_move": candidate_move,
@@ -417,14 +584,14 @@ def main() -> None:
                 }
                 run_id = f"pos{index:04d}_validator_baseline"
                 artifacts = _execute_with_run_logger(
-                    engine=validator.engine,
                     system_def=validator.system_def,
                     system_path=validator.system_path,
                     payload=payload,
                     runs_root=benchmark_dir / "psf_runs" / validator.system_def.id,
                     run_id=run_id,
+                    provider_resolver=_provider_resolver,
                 )
-                token_totals[validator.system_def.id] = token_totals.get(validator.system_def.id, 0) + int(
+                local_token_totals[validator.system_def.id] = local_token_totals.get(validator.system_def.id, 0) + int(
                     (artifacts.metrics or {}).get("total_tokens") or 0
                 )
                 baseline_entry: dict[str, Any] = {
@@ -439,13 +606,11 @@ def main() -> None:
                 predicted_is_legal: Optional[bool] = None
                 if artifacts.status == "success" and artifacts.final_output is not None:
                     try:
-                        predicted_is_legal = _coerce_bool(
-                            artifacts.final_output.get(args.validator_output_field)
-                        )
+                        predicted_is_legal = _coerce_bool(artifacts.final_output.get(args.validator_output_field))
                     except Exception as exc:
                         baseline_entry["parse_error"] = str(exc)
                 if predicted_is_legal is None:
-                    validator_baseline[validator.system_def.id]["errors"] += 1
+                    local_validator_baseline[validator.system_def.id]["errors"] += 1
                     baseline_entry["predicted_is_legal"] = None
                     baseline_entry["correct"] = False
                 else:
@@ -453,131 +618,158 @@ def main() -> None:
                     correct = predicted_is_legal == expected_is_legal
                     baseline_entry["correct"] = correct
                     if correct:
-                        validator_baseline[validator.system_def.id]["correct"] += 1
+                        local_validator_baseline[validator.system_def.id]["correct"] += 1
                 record["validator_baseline"][validator.system_def.id] = baseline_entry
 
         # --- Generator run (optional) ---
         if generator_systems:
             record["generator"] = {}
         for generator_system in generator_systems:
-            generator[generator_system.system_def.id]["total"] += 1
+            local_generator.setdefault(
+                generator_system.system_def.id,
+                {
+                    "total": 0,
+                    "errors": 0,
+                    "missing_output": 0,
+                    "invalid_move": 0,
+                    "oracle_parseable": 0,
+                    "oracle_legal": 0,
+                },
+            )
+            local_generator[generator_system.system_def.id]["total"] += 1
             payload = {
                 "position_fen": position.fen,
-                "move_notation": "san",
+                "move_notation": generator_system.move_notation,
                 "illegal_moves": [],
                 "attempt": 1,
             }
             run_id = f"pos{index:04d}_generator"
             artifacts = _execute_with_run_logger(
-                engine=generator_system.engine,
                 system_def=generator_system.system_def,
                 system_path=generator_system.system_path,
                 payload=payload,
                 runs_root=benchmark_dir / "psf_runs" / generator_system.system_def.id,
                 run_id=run_id,
+                provider_resolver=_provider_resolver,
             )
-            token_totals[generator_system.system_def.id] = token_totals.get(generator_system.system_def.id, 0) + int(
-                (artifacts.metrics or {}).get("total_tokens") or 0
-            )
+            local_token_totals[generator_system.system_def.id] = local_token_totals.get(
+                generator_system.system_def.id, 0
+            ) + int((artifacts.metrics or {}).get("total_tokens") or 0)
+
             gen_entry: dict[str, Any] = {
                 "run_dir": str(artifacts.run_dir),
                 "status": artifacts.status,
                 "error": artifacts.error,
+                "move_notation": generator_system.move_notation,
+                "move_output_field": generator_system.move_output_field,
             }
             if artifacts.status != "success" or artifacts.final_output is None:
-                generator[generator_system.system_def.id]["errors"] += 1
-                gen_entry["move_san"] = None
+                local_generator[generator_system.system_def.id]["errors"] += 1
+                gen_entry["move"] = None
                 record["generator"][generator_system.system_def.id] = gen_entry
                 continue
-            if args.generator_output_field not in artifacts.final_output:
-                generator[generator_system.system_def.id]["missing_output"] += 1
-                gen_entry["move_san"] = None
-                gen_entry["missing_output_field"] = args.generator_output_field
+            if generator_system.move_output_field not in artifacts.final_output:
+                local_generator[generator_system.system_def.id]["missing_output"] += 1
+                gen_entry["move"] = None
+                gen_entry["missing_output_field"] = generator_system.move_output_field
                 record["generator"][generator_system.system_def.id] = gen_entry
                 continue
-            move_value = artifacts.final_output.get(args.generator_output_field)
+            move_value = artifacts.final_output.get(generator_system.move_output_field)
             if not isinstance(move_value, str) or not move_value.strip():
-                generator[generator_system.system_def.id]["invalid_move"] += 1
-                gen_entry["move_san"] = None
+                local_generator[generator_system.system_def.id]["invalid_move"] += 1
+                gen_entry["move"] = None
                 gen_entry["invalid_output"] = move_value
                 record["generator"][generator_system.system_def.id] = gen_entry
                 continue
-            move_san = move_value.strip()
-            oracle_is_legal, oracle_error = _oracle_san_legality(fen=position.fen, move_san=move_san)
+            move = move_value.strip()
+            oracle_is_legal, oracle_error = _oracle_legality(
+                fen=position.fen, move=move, notation=generator_system.move_notation
+            )
             if oracle_error is None:
-                generator[generator_system.system_def.id]["oracle_parseable"] += 1
+                local_generator[generator_system.system_def.id]["oracle_parseable"] += 1
             if oracle_is_legal:
-                generator[generator_system.system_def.id]["oracle_legal"] += 1
-            gen_entry["move_san"] = move_san
+                local_generator[generator_system.system_def.id]["oracle_legal"] += 1
+            gen_entry["move"] = move
+            if generator_system.move_notation == "uci":
+                gen_entry["move_uci"] = move
+            else:
+                gen_entry["move_san"] = move
             gen_entry["oracle_is_legal"] = bool(oracle_is_legal)
             gen_entry["oracle_error"] = oracle_error
             record["generator"][generator_system.system_def.id] = gen_entry
 
-        # Pipeline results are only computed when exactly 1 generator + 1 validator are provided.
-        generator_move: Optional[str] = None
-        generator_oracle_is_legal: Optional[bool] = None
-        generator_oracle_error: Optional[str] = None
-        generator_run_dir: Optional[str] = None
-        if pipeline_enabled and record.get("generator"):
-            only_gen_id = generator_systems[0].system_def.id
-            gen_entry = record["generator"].get(only_gen_id, {})
-            generator_move = gen_entry.get("move_san")
-            generator_oracle_is_legal = gen_entry.get("oracle_is_legal")
-            generator_oracle_error = gen_entry.get("oracle_error")
-            generator_run_dir = gen_entry.get("run_dir")
-
         # --- Validator on generator move + pipeline loop (optional) ---
         if pipeline_enabled:
+            pipeline_notation = generator_systems[0].move_notation
+            pipeline_move_output_field = generator_systems[0].move_output_field
             generator_def = generator_systems[0].system_def
-            generator_engine = generator_systems[0].engine
             generator_path = generator_systems[0].system_path
             validator_def = validator_systems[0].system_def
-            validator_engine = validator_systems[0].engine
             validator_path = validator_systems[0].system_path
-            if validator_def.id not in validator_on_generator:
-                validator_on_generator[validator_def.id] = {"total": 0, "correct": 0, "errors": 0}
-            pipeline_total += 1
+
+            local_validator_on_generator.setdefault(validator_def.id, {"total": 0, "correct": 0, "errors": 0})
+            local_pipeline["total"] += 1
+
+            generator_move: Optional[str] = None
+            generator_oracle_is_legal: Optional[bool] = None
+            generator_oracle_error: Optional[str] = None
+            generator_run_dir: Optional[str] = None
+            if record.get("generator"):
+                only_gen_id = generator_def.id
+                gen_entry = record["generator"].get(only_gen_id, {})
+                generator_move = gen_entry.get("move")
+                generator_oracle_is_legal = gen_entry.get("oracle_is_legal")
+                generator_oracle_error = gen_entry.get("oracle_error")
+                generator_run_dir = gen_entry.get("run_dir")
+
             if generator_move is None:
-                pipeline_errors += 1
-                pipeline_total_attempts += 1
-                record["pipeline"] = {
+                local_pipeline["errors"] += 1
+                local_pipeline["total_attempts"] += 1
+                pipeline_entry: dict[str, Any] = {
                     "max_attempts": args.pipeline_max_attempts,
                     "status": "error",
                     "error": "generator did not produce a usable move on attempt 1",
                     "accepted": False,
-                    "accepted_move_san": None,
+                    "move_notation": pipeline_notation,
+                    "accepted_move": None,
                     "accepted_oracle_is_legal": None,
                     "accepted_oracle_error": None,
                     "attempts": [
                         {
                             "attempt": 1,
                             "generator_run_dir": generator_run_dir,
-                            "move_san": None,
+                            "move": None,
                         }
                     ],
                 }
+                if pipeline_notation == "uci":
+                    pipeline_entry["accepted_move_uci"] = None
+                else:
+                    pipeline_entry["accepted_move_san"] = None
+                record["pipeline"] = pipeline_entry
             else:
                 # Validator on generator attempt 1.
-                validator_on_generator[validator_def.id]["total"] += 1
+                local_validator_on_generator[validator_def.id]["total"] += 1
                 payload = {
                     "position_fen": position.fen,
                     "candidate_move": generator_move,
-                    "move_notation": "san",
+                    "move_notation": pipeline_notation,
                 }
                 run_id = f"pos{index:04d}_validator_on_generator_attempt01"
                 v_artifacts = _execute_with_run_logger(
-                    engine=validator_engine,
                     system_def=validator_def,
                     system_path=validator_path,
                     payload=payload,
                     runs_root=benchmark_dir / "psf_runs" / validator_def.id,
                     run_id=run_id,
+                    provider_resolver=_provider_resolver,
                 )
-                token_totals[validator_def.id] = token_totals.get(validator_def.id, 0) + int(
+                local_token_totals[validator_def.id] = local_token_totals.get(validator_def.id, 0) + int(
                     (v_artifacts.metrics or {}).get("total_tokens") or 0
                 )
                 v_entry: dict[str, Any] = {
                     "candidate_move": generator_move,
+                    "move_notation": pipeline_notation,
                     "oracle_is_legal": generator_oracle_is_legal,
                     "oracle_error": generator_oracle_error,
                     "run_dir": str(v_artifacts.run_dir),
@@ -591,7 +783,7 @@ def main() -> None:
                     except Exception as exc:
                         v_entry["parse_error"] = str(exc)
                 if predicted_is_legal is None or generator_oracle_is_legal is None:
-                    validator_on_generator[validator_def.id]["errors"] += 1
+                    local_validator_on_generator[validator_def.id]["errors"] += 1
                     v_entry["predicted_is_legal"] = None
                     v_entry["correct"] = False
                 else:
@@ -599,7 +791,7 @@ def main() -> None:
                     correct = predicted_is_legal == generator_oracle_is_legal
                     v_entry["correct"] = correct
                     if correct:
-                        validator_on_generator[validator_def.id]["correct"] += 1
+                        local_validator_on_generator[validator_def.id]["correct"] += 1
                 record["validator_on_generator"] = v_entry
 
                 # Pipeline: retry generator until validator accepts (or attempts exhausted).
@@ -610,23 +802,23 @@ def main() -> None:
                 accepted_oracle_error: Optional[str] = None
                 pipeline_error: Optional[str] = None
 
-                # Attempt 1 reuses the generator+validator results above.
                 pipeline_attempts.append(
                     {
                         "attempt": 1,
                         "generator_run_dir": generator_run_dir,
                         "validator_run_dir": str(v_artifacts.run_dir),
-                        "move_san": generator_move,
+                        "move": generator_move,
+                        "move_notation": pipeline_notation,
                         "validator_is_legal": v_entry.get("predicted_is_legal"),
                         "oracle_is_legal": generator_oracle_is_legal,
                         "oracle_error": generator_oracle_error,
                     }
                 )
-                pipeline_total_attempts += 1
+                local_pipeline["total_attempts"] += 1
 
                 first_verdict = v_entry.get("predicted_is_legal")
                 if first_verdict is None:
-                    pipeline_errors += 1
+                    local_pipeline["errors"] += 1
                     pipeline_error = "validator did not produce a usable verdict on attempt 1"
                 elif first_verdict is True:
                     accepted_move = generator_move
@@ -637,36 +829,36 @@ def main() -> None:
                     for attempt in range(2, args.pipeline_max_attempts + 1):
                         payload = {
                             "position_fen": position.fen,
-                            "move_notation": "san",
+                            "move_notation": pipeline_notation,
                             "illegal_moves": illegal_moves,
                             "attempt": attempt,
                         }
                         run_id = f"pos{index:04d}_pipeline_generator_attempt{attempt:02d}"
                         gen_artifacts = _execute_with_run_logger(
-                            engine=generator_engine,
                             system_def=generator_def,
                             system_path=generator_path,
                             payload=payload,
                             runs_root=benchmark_dir / "psf_runs" / generator_def.id,
                             run_id=run_id,
+                            provider_resolver=_provider_resolver,
                         )
-                        token_totals[generator_def.id] = token_totals.get(generator_def.id, 0) + int(
+                        local_token_totals[generator_def.id] = local_token_totals.get(generator_def.id, 0) + int(
                             (gen_artifacts.metrics or {}).get("total_tokens") or 0
                         )
-                        move_san: Optional[str] = None
+                        move: Optional[str] = None
                         oracle_is_legal: Optional[bool] = None
                         oracle_error: Optional[str] = None
                         gen_error: Optional[str] = None
                         if gen_artifacts.status != "success" or gen_artifacts.final_output is None:
                             gen_error = gen_artifacts.error or "generator failed"
                         else:
-                            move_value = gen_artifacts.final_output.get(args.generator_output_field)
+                            move_value = gen_artifacts.final_output.get(pipeline_move_output_field)
                             if not isinstance(move_value, str) or not move_value.strip():
-                                gen_error = f"invalid generator output '{args.generator_output_field}'"
+                                gen_error = f"invalid generator output '{pipeline_move_output_field}'"
                             else:
-                                move_san = move_value.strip()
-                                oracle_is_legal, oracle_error = _oracle_san_legality(
-                                    fen=position.fen, move_san=move_san
+                                move = move_value.strip()
+                                oracle_is_legal, oracle_error = _oracle_legality(
+                                    fen=position.fen, move=move, notation=pipeline_notation
                                 )
 
                         # Validator call for this attempt (only if we got a move).
@@ -674,22 +866,22 @@ def main() -> None:
                         v_status = "skipped"
                         v_error: Optional[str] = None
                         v_pred: Optional[bool] = None
-                        if move_san is not None:
+                        if move is not None:
                             v_payload = {
                                 "position_fen": position.fen,
-                                "candidate_move": move_san,
-                                "move_notation": "san",
+                                "candidate_move": move,
+                                "move_notation": pipeline_notation,
                             }
                             v_run_id = f"pos{index:04d}_pipeline_validator_attempt{attempt:02d}"
                             v_art = _execute_with_run_logger(
-                                engine=validator_engine,
                                 system_def=validator_def,
                                 system_path=validator_path,
                                 payload=v_payload,
                                 runs_root=benchmark_dir / "psf_runs" / validator_def.id,
                                 run_id=v_run_id,
+                                provider_resolver=_provider_resolver,
                             )
-                            token_totals[validator_def.id] = token_totals.get(validator_def.id, 0) + int(
+                            local_token_totals[validator_def.id] = local_token_totals.get(validator_def.id, 0) + int(
                                 (v_art.metrics or {}).get("total_tokens") or 0
                             )
                             v_run_dir = str(v_art.run_dir)
@@ -701,63 +893,116 @@ def main() -> None:
                                 except Exception as exc:
                                     v_error = str(exc)
 
-                        pipeline_attempts.append(
-                            {
-                                "attempt": attempt,
-                                "generator_run_dir": str(gen_artifacts.run_dir),
-                                "generator_status": gen_artifacts.status,
-                                "generator_error": gen_error,
-                                "validator_run_dir": v_run_dir,
-                                "validator_status": v_status,
-                                "validator_error": v_error,
-                                "move_san": move_san,
-                                "validator_is_legal": v_pred,
-                                "oracle_is_legal": oracle_is_legal,
-                                "oracle_error": oracle_error,
-                            }
-                        )
-                        pipeline_total_attempts += 1
+                        attempt_entry: dict[str, Any] = {
+                            "attempt": attempt,
+                            "generator_run_dir": str(gen_artifacts.run_dir),
+                            "generator_status": gen_artifacts.status,
+                            "generator_error": gen_error,
+                            "validator_run_dir": v_run_dir,
+                            "validator_status": v_status,
+                            "validator_error": v_error,
+                            "move": move,
+                            "move_notation": pipeline_notation,
+                            "validator_is_legal": v_pred,
+                            "oracle_is_legal": oracle_is_legal,
+                            "oracle_error": oracle_error,
+                        }
+                        if pipeline_notation == "uci":
+                            attempt_entry["move_uci"] = move
+                        else:
+                            attempt_entry["move_san"] = move
+                        pipeline_attempts.append(attempt_entry)
+                        local_pipeline["total_attempts"] += 1
 
                         if gen_error is not None:
-                            pipeline_errors += 1
+                            local_pipeline["errors"] += 1
                             pipeline_error = gen_error
                             break
                         if v_pred is None:
-                            pipeline_errors += 1
+                            local_pipeline["errors"] += 1
                             pipeline_error = v_error or "validator did not produce a usable verdict"
                             break
                         if v_pred is True:
-                            accepted_move = move_san
+                            accepted_move = move
                             accepted_oracle_is_legal = bool(oracle_is_legal)
                             accepted_oracle_error = oracle_error
                             break
-                        if move_san is not None:
-                            illegal_moves.append(move_san)
+                        if move is not None:
+                            illegal_moves.append(move)
 
                 status = "accepted" if accepted_move is not None else ("error" if pipeline_error else "rejected")
-                pipeline_entry: dict[str, Any] = {
+                pipeline_entry = {
                     "max_attempts": args.pipeline_max_attempts,
                     "status": status,
                     "error": pipeline_error,
                     "accepted": accepted_move is not None,
-                    "accepted_move_san": accepted_move,
+                    "move_notation": pipeline_notation,
+                    "accepted_move": accepted_move,
                     "accepted_oracle_is_legal": accepted_oracle_is_legal,
                     "accepted_oracle_error": accepted_oracle_error,
                     "attempts": pipeline_attempts,
                 }
+                if pipeline_notation == "uci":
+                    pipeline_entry["accepted_move_uci"] = accepted_move
+                else:
+                    pipeline_entry["accepted_move_san"] = accepted_move
                 if status == "accepted":
-                    pipeline_accepts += 1
+                    local_pipeline["accepts"] += 1
                     if accepted_oracle_is_legal is True:
-                        pipeline_oracle_legal_accepts += 1
+                        local_pipeline["oracle_legal_accepts"] += 1
                     elif accepted_oracle_is_legal is False:
-                        pipeline_false_accepts += 1
+                        local_pipeline["false_accepts"] += 1
                 elif status == "rejected":
-                    pipeline_rejects += 1
+                    local_pipeline["rejects"] += 1
                 record["pipeline"] = pipeline_entry
 
-        _append_jsonl(results_path, record)
-        if args.progress_every > 0 and index % args.progress_every == 0:
-            logger.info("Progress: %s/%s positions", index, args.iterations)
+        return PositionOutcome(
+            index=index,
+            record=record,
+            token_totals=local_token_totals,
+            validator_baseline=local_validator_baseline,
+            generator=local_generator,
+            validator_on_generator=local_validator_on_generator,
+            pipeline=local_pipeline,
+        )
+
+    def _consume_outcome(outcome: PositionOutcome) -> None:
+        _merge_token_totals(token_totals, outcome.token_totals)
+        _merge_nested_counts(validator_baseline, outcome.validator_baseline)
+        _merge_nested_counts(generator, outcome.generator)
+        _merge_nested_counts(validator_on_generator, outcome.validator_on_generator)
+        nonlocal pipeline_total, pipeline_accepts, pipeline_rejects, pipeline_false_accepts, pipeline_oracle_legal_accepts, pipeline_errors, pipeline_total_attempts
+        pipeline_total += int(outcome.pipeline.get("total", 0))
+        pipeline_accepts += int(outcome.pipeline.get("accepts", 0))
+        pipeline_rejects += int(outcome.pipeline.get("rejects", 0))
+        pipeline_false_accepts += int(outcome.pipeline.get("false_accepts", 0))
+        pipeline_oracle_legal_accepts += int(outcome.pipeline.get("oracle_legal_accepts", 0))
+        pipeline_errors += int(outcome.pipeline.get("errors", 0))
+        pipeline_total_attempts += int(outcome.pipeline.get("total_attempts", 0))
+        _append_jsonl(results_path, outcome.record)
+
+    if max_workers > 1:
+        futures = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for idx, position in enumerate(positions, start=1):
+                futures.append(executor.submit(_evaluate_position, idx, position))
+            pending: dict[int, PositionOutcome] = {}
+            next_to_write = 1
+            completed = 0
+            for future in as_completed(futures):
+                outcome = future.result()
+                pending[outcome.index] = outcome
+                completed += 1
+                while next_to_write in pending:
+                    _consume_outcome(pending.pop(next_to_write))
+                    next_to_write += 1
+                if args.progress_every > 0 and completed % args.progress_every == 0:
+                    logger.info("Progress: %s/%s positions", completed, args.iterations)
+    else:
+        for idx, position in enumerate(positions, start=1):
+            _consume_outcome(_evaluate_position(idx, position))
+            if args.progress_every > 0 and idx % args.progress_every == 0:
+                logger.info("Progress: %s/%s positions", idx, args.iterations)
 
     finished_at = datetime.now(timezone.utc).isoformat()
     generator_summaries: dict[str, Any] = {}
