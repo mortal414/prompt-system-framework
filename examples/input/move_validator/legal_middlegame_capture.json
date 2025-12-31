@@ -1,6 +1,0 @@
-{
-  "position_fen": "r1bqkbnr/1pp1pppp/p1n5/1B1p4/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 2 4",
-  "candidate_move": "Bxc6+",
-  "move_context": "Tactical capture to double Black's pawns in a Ruy Lopez structure.",
-  "expected_legality": "legal"
-}

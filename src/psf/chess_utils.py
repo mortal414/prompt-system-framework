@@ -91,3 +91,22 @@ def generate_illegal_san(board: chess.Board, rng: random.Random) -> str:
             return candidate
     return "Qz9"
 
+
+def generate_illegal_uci(board: chess.Board, rng: random.Random) -> str:
+    squares = [chess.square_name(sq) for sq in chess.SQUARES]
+    promotion_pieces = ["", "q", "r", "b", "n"]
+    for _ in range(5_000):
+        from_sq = rng.choice(squares)
+        to_sq = rng.choice(squares)
+        if from_sq == to_sq:
+            continue
+        promotion = rng.choice(promotion_pieces)
+        candidate = f"{from_sq}{to_sq}{promotion}"
+        try:
+            move = chess.Move.from_uci(candidate)
+        except ValueError:
+            continue
+        if board.is_legal(move):
+            continue
+        return candidate
+    return "a1a1"

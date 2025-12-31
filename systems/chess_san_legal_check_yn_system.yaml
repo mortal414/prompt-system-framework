@@ -40,18 +40,23 @@ nodes:
   - id: "ask_legality_yn"
     label: "Ask legality as Y/N"
     provider: "openai"
-    model: "gpt-4o-mini"
+    model: "gpt-4o"
     temperature: 0.0
     max_tokens: 32
     instructions: |
       You are a strict chess arbiter.
       Determine if the candidate move is legal in the exact position provided.
+      The move is in SAN notation (e.g. e4, Nf3, O-O, exd6, e8=Q+).
       Reply with exactly one character: "Y" (legal) or "N" (illegal). No other text.
     prompt_template: |
       FEN: {{ position_fen }}
       Side to move: {{ "white" if position_fen.split(" ")[1] == "w" else "black" }}
+      Castling rights: {{ position_fen.split(" ")[2] }}
+      En passant target: {{ position_fen.split(" ")[3] }}
       MOVE (SAN): {{ candidate_move }}
-      {% if move_context %}Context: {{ move_context }}{% endif %}
+      {% if move_context %}
+      Context: {{ move_context }}
+      {% endif %}
 
       Is the move legal given the game state? (Y/N)
     input_bindings:
@@ -76,7 +81,10 @@ nodes:
     instructions: |
       Convert the raw verdict into strict JSON.
       Rules:
-      - If the first non-whitespace character is "Y" or "y", is_legal=true and verdict="Y".
+      - If the first non-whitespace token starts with "Y" (e.g. "Y", "Yes"), is_legal=true and verdict="Y".
+      - If it starts with "N" (e.g. "N", "No"), is_legal=false and verdict="N".
+      - If it starts with "L" (e.g. "Legal"), is_legal=true and verdict="Y".
+      - If it starts with "I" (e.g. "Illegal"), is_legal=false and verdict="N".
       - Otherwise, is_legal=false and verdict="N".
       - reason must be a short, neutral phrase (do not restate the full position).
     prompt_template: |

@@ -13,7 +13,7 @@ from typing import Any, Optional
 
 import chess
 
-from psf.chess_utils import GeneratedPosition, generate_illegal_san, play_random_plies
+from psf.chess_utils import GeneratedPosition, generate_illegal_san, generate_illegal_uci, play_random_plies
 from psf.config_loader import load_system_definition
 from psf.engine import ExecutionEngine, ExecutionResult
 from psf.exceptions import ExecutionError
@@ -28,6 +28,21 @@ class RunArtifacts:
     final_output: Optional[dict[str, Any]]
     error: Optional[str]
     metrics: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class GeneratorSystem:
+    system_path: Path
+    system_def: SystemDef
+    engine: ExecutionEngine
+
+
+@dataclass(frozen=True)
+class ValidatorSystem:
+    system_path: Path
+    system_def: SystemDef
+    engine: ExecutionEngine
+    move_notation: str
 
 
 def _setup_logging(*, level: str, log_file: Path | None) -> logging.Logger:
@@ -77,6 +92,15 @@ def _oracle_san_legality(*, fen: str, move_san: str) -> tuple[bool, Optional[str
     try:
         parsed = board.parse_san(move_san)
     except (chess.IllegalMoveError, chess.InvalidMoveError, ValueError) as exc:
+        return False, str(exc)
+    return board.is_legal(parsed), None
+
+
+def _oracle_uci_legality(*, fen: str, move_uci: str) -> tuple[bool, Optional[str]]:
+    board = chess.Board(fen)
+    try:
+        parsed = chess.Move.from_uci(move_uci)
+    except ValueError as exc:
         return False, str(exc)
     return board.is_legal(parsed), None
 
@@ -134,6 +158,15 @@ def _load_system(path: Path) -> tuple[SystemDef, ExecutionEngine]:
     return system_def, ExecutionEngine(system_def)
 
 
+def _infer_move_notation(*, system_def: SystemDef, system_path: Path, default: str) -> str:
+    haystack = f"{system_def.id} {system_path.name}".lower()
+    if "uci" in haystack:
+        return "uci"
+    if "san" in haystack:
+        return "san"
+    return default
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Random-position chess benchmark suite (SAN-first). "
@@ -151,8 +184,9 @@ def main() -> None:
     parser.add_argument(
         "--generator-system",
         type=Path,
-        default=None,
-        help="Move generator system YAML/JSON (SAN).",
+        action="append",
+        default=[],
+        help="Move generator system YAML/JSON (repeatable).",
     )
     parser.add_argument(
         "--generator-output-field",
@@ -163,8 +197,9 @@ def main() -> None:
     parser.add_argument(
         "--validator-system",
         type=Path,
-        default=None,
-        help="Legality-check system YAML/JSON (SAN).",
+        action="append",
+        default=[],
+        help="Legality-check system YAML/JSON (repeatable).",
     )
     parser.add_argument(
         "--validator-output-field",
@@ -214,7 +249,7 @@ def main() -> None:
         raise SystemExit("--progress-every must be >= 0")
     if not (0.0 <= args.illegal_ratio <= 1.0):
         raise SystemExit("--illegal-ratio must be between 0 and 1")
-    if args.generator_system is None and args.validator_system is None:
+    if not args.generator_system and not args.validator_system:
         raise SystemExit("Provide at least one of --generator-system or --validator-system")
 
     run_root: Path = args.run_dir.expanduser().resolve()
@@ -230,18 +265,20 @@ def main() -> None:
             log_file = Path(args.log_file).expanduser().resolve()
     logger = _setup_logging(level=args.log_level, log_file=log_file)
 
-    generator_path = args.generator_system.expanduser().resolve() if args.generator_system else None
-    validator_path = args.validator_system.expanduser().resolve() if args.validator_system else None
+    generator_systems: list[GeneratorSystem] = []
+    for path in args.generator_system:
+        resolved = path.expanduser().resolve()
+        system_def, engine = _load_system(resolved)
+        generator_systems.append(GeneratorSystem(system_path=resolved, system_def=system_def, engine=engine))
 
-    generator_def: SystemDef | None = None
-    generator_engine: ExecutionEngine | None = None
-    if generator_path is not None:
-        generator_def, generator_engine = _load_system(generator_path)
-
-    validator_def: SystemDef | None = None
-    validator_engine: ExecutionEngine | None = None
-    if validator_path is not None:
-        validator_def, validator_engine = _load_system(validator_path)
+    validator_systems: list[ValidatorSystem] = []
+    for path in args.validator_system:
+        resolved = path.expanduser().resolve()
+        system_def, engine = _load_system(resolved)
+        notation = _infer_move_notation(system_def=system_def, system_path=resolved, default="san")
+        validator_systems.append(
+            ValidatorSystem(system_path=resolved, system_def=system_def, engine=engine, move_notation=notation)
+        )
 
     manifest = {
         "benchmark_id": benchmark_id,
@@ -251,8 +288,19 @@ def main() -> None:
         "seed": args.seed,
         "illegal_ratio": args.illegal_ratio,
         "pipeline_max_attempts": args.pipeline_max_attempts,
-        "generator_system": str(generator_path) if generator_path else None,
-        "validator_system": str(validator_path) if validator_path else None,
+        "generator_systems": [
+            {"path": str(s.system_path), "id": s.system_def.id, "label": s.system_def.label}
+            for s in generator_systems
+        ],
+        "validator_systems": [
+            {
+                "path": str(s.system_path),
+                "id": s.system_def.id,
+                "label": s.system_def.label,
+                "move_notation": s.move_notation,
+            }
+            for s in validator_systems
+        ],
         "started_at": datetime.now(timezone.utc).isoformat(),
         "artifacts": {
             "positions": "positions.jsonl",
@@ -270,28 +318,34 @@ def main() -> None:
 
     logger.info("Benchmark: %s", benchmark_id)
     logger.info("Positions: %s | plies=%s | seed=%s", args.iterations, args.plies, args.seed)
-    if generator_def is not None:
-        logger.info("Generator: %s (%s)", generator_def.id, generator_def.label or "unnamed")
-    if validator_def is not None:
-        logger.info("Validator: %s (%s)", validator_def.id, validator_def.label or "unnamed")
+    if generator_systems:
+        logger.info("Generators: %s", ", ".join(s.system_def.id for s in generator_systems))
+    if validator_systems:
+        logger.info(
+            "Validators: %s",
+            ", ".join(f"{s.system_def.id}({s.move_notation})" for s in validator_systems),
+        )
     logger.info("Artifacts: %s", benchmark_dir)
 
     pos_rng = random.Random(args.seed)
     case_rng = random.Random(args.seed + 1)
 
     # Aggregates
-    validator_baseline_total = 0
-    validator_baseline_correct = 0
-    validator_baseline_errors = 0
-    validator_on_generator_total = 0
-    validator_on_generator_correct = 0
-    validator_on_generator_errors = 0
-    generator_total = 0
-    generator_errors = 0
-    generator_missing_output = 0
-    generator_invalid_move = 0
-    generator_oracle_parseable = 0
-    generator_oracle_legal = 0
+    validator_baseline: dict[str, dict[str, int]] = {
+        s.system_def.id: {"total": 0, "correct": 0, "errors": 0} for s in validator_systems
+    }
+    validator_on_generator: dict[str, dict[str, int]] = {}
+    generator: dict[str, dict[str, int]] = {
+        s.system_def.id: {
+            "total": 0,
+            "errors": 0,
+            "missing_output": 0,
+            "invalid_move": 0,
+            "oracle_parseable": 0,
+            "oracle_legal": 0,
+        }
+        for s in generator_systems
+    }
     pipeline_total = 0
     pipeline_accepts = 0
     pipeline_rejects = 0
@@ -302,14 +356,9 @@ def main() -> None:
 
     token_totals: dict[str, int] = {}
 
-    pipeline_enabled = (
-        generator_def is not None
-        and generator_engine is not None
-        and generator_path is not None
-        and validator_def is not None
-        and validator_engine is not None
-        and validator_path is not None
-    )
+    pipeline_enabled = len(generator_systems) == 1 and len(validator_systems) == 1
+    if (generator_systems and validator_systems) and not pipeline_enabled:
+        logger.info("Pipeline mode disabled (requires exactly 1 generator and 1 validator).")
 
     for index in range(1, args.iterations + 1):
         position: GeneratedPosition = play_random_plies(plies=args.plies, rng=pos_rng)
@@ -333,71 +382,85 @@ def main() -> None:
         }
 
         # --- Validator baseline on random labeled moves (optional) ---
-        if validator_def is not None and validator_engine is not None and validator_path is not None:
+        if validator_systems:
             board = chess.Board(position.fen)
             want_illegal = case_rng.random() < args.illegal_ratio
             if want_illegal:
-                candidate_move = generate_illegal_san(board, case_rng)
+                candidate_san = generate_illegal_san(board, case_rng)
+                candidate_uci = generate_illegal_uci(board, case_rng)
             else:
                 legal_moves = list(board.legal_moves)
                 chosen = case_rng.choice(legal_moves)
-                candidate_move = board.san(chosen)
-            expected_is_legal, expected_error = _oracle_san_legality(fen=position.fen, move_san=candidate_move)
-            expected_legality = "legal" if expected_is_legal else "illegal"
+                candidate_san = board.san(chosen)
+                candidate_uci = chosen.uci()
 
-            validator_baseline_total += 1
-            payload = {
-                "position_fen": position.fen,
-                "candidate_move": candidate_move,
-                "move_notation": "san",
-                "expected_legality": expected_legality,
-            }
-            run_id = f"pos{index:04d}_validator_baseline"
-            artifacts = _execute_with_run_logger(
-                engine=validator_engine,
-                system_def=validator_def,
-                system_path=validator_path,
-                payload=payload,
-                runs_root=benchmark_dir / "psf_runs" / validator_def.id,
-                run_id=run_id,
-            )
-            token_totals[validator_def.id] = token_totals.get(validator_def.id, 0) + int(
-                (artifacts.metrics or {}).get("total_tokens") or 0
-            )
-            baseline_entry: dict[str, Any] = {
-                "candidate_move": candidate_move,
-                "expected_is_legal": expected_is_legal,
-                "expected_error": expected_error,
-                "run_dir": str(artifacts.run_dir),
-                "status": artifacts.status,
-                "error": artifacts.error,
-            }
-            predicted_is_legal: Optional[bool] = None
-            if artifacts.status == "success" and artifacts.final_output is not None:
-                try:
-                    predicted_is_legal = _coerce_bool(artifacts.final_output.get(args.validator_output_field))
-                except Exception as exc:
-                    baseline_entry["parse_error"] = str(exc)
-            if predicted_is_legal is None:
-                validator_baseline_errors += 1
-                baseline_entry["predicted_is_legal"] = None
-                baseline_entry["correct"] = False
-            else:
-                baseline_entry["predicted_is_legal"] = predicted_is_legal
-                correct = predicted_is_legal == expected_is_legal
-                baseline_entry["correct"] = correct
-                if correct:
-                    validator_baseline_correct += 1
-            record["validator_baseline"] = baseline_entry
+            record["validator_baseline"] = {}
+            for validator in validator_systems:
+                if validator.move_notation == "uci":
+                    candidate_move = candidate_uci
+                    expected_is_legal, expected_error = _oracle_uci_legality(
+                        fen=position.fen, move_uci=candidate_move
+                    )
+                else:
+                    candidate_move = candidate_san
+                    expected_is_legal, expected_error = _oracle_san_legality(
+                        fen=position.fen, move_san=candidate_move
+                    )
+                expected_legality = "legal" if expected_is_legal else "illegal"
+
+                validator_baseline[validator.system_def.id]["total"] += 1
+                payload = {
+                    "position_fen": position.fen,
+                    "candidate_move": candidate_move,
+                    "move_notation": validator.move_notation,
+                    "expected_legality": expected_legality,
+                }
+                run_id = f"pos{index:04d}_validator_baseline"
+                artifacts = _execute_with_run_logger(
+                    engine=validator.engine,
+                    system_def=validator.system_def,
+                    system_path=validator.system_path,
+                    payload=payload,
+                    runs_root=benchmark_dir / "psf_runs" / validator.system_def.id,
+                    run_id=run_id,
+                )
+                token_totals[validator.system_def.id] = token_totals.get(validator.system_def.id, 0) + int(
+                    (artifacts.metrics or {}).get("total_tokens") or 0
+                )
+                baseline_entry: dict[str, Any] = {
+                    "candidate_move": candidate_move,
+                    "move_notation": validator.move_notation,
+                    "expected_is_legal": expected_is_legal,
+                    "expected_error": expected_error,
+                    "run_dir": str(artifacts.run_dir),
+                    "status": artifacts.status,
+                    "error": artifacts.error,
+                }
+                predicted_is_legal: Optional[bool] = None
+                if artifacts.status == "success" and artifacts.final_output is not None:
+                    try:
+                        predicted_is_legal = _coerce_bool(
+                            artifacts.final_output.get(args.validator_output_field)
+                        )
+                    except Exception as exc:
+                        baseline_entry["parse_error"] = str(exc)
+                if predicted_is_legal is None:
+                    validator_baseline[validator.system_def.id]["errors"] += 1
+                    baseline_entry["predicted_is_legal"] = None
+                    baseline_entry["correct"] = False
+                else:
+                    baseline_entry["predicted_is_legal"] = predicted_is_legal
+                    correct = predicted_is_legal == expected_is_legal
+                    baseline_entry["correct"] = correct
+                    if correct:
+                        validator_baseline[validator.system_def.id]["correct"] += 1
+                record["validator_baseline"][validator.system_def.id] = baseline_entry
 
         # --- Generator run (optional) ---
-        generator_move: Optional[str] = None
-        generator_oracle_is_legal: Optional[bool] = None
-        generator_oracle_error: Optional[str] = None
-        generator_run_dir: Optional[str] = None
-
-        if generator_def is not None and generator_engine is not None and generator_path is not None:
-            generator_total += 1
+        if generator_systems:
+            record["generator"] = {}
+        for generator_system in generator_systems:
+            generator[generator_system.system_def.id]["total"] += 1
             payload = {
                 "position_fen": position.fen,
                 "move_notation": "san",
@@ -406,57 +469,73 @@ def main() -> None:
             }
             run_id = f"pos{index:04d}_generator"
             artifacts = _execute_with_run_logger(
-                engine=generator_engine,
-                system_def=generator_def,
-                system_path=generator_path,
+                engine=generator_system.engine,
+                system_def=generator_system.system_def,
+                system_path=generator_system.system_path,
                 payload=payload,
-                runs_root=benchmark_dir / "psf_runs" / generator_def.id,
+                runs_root=benchmark_dir / "psf_runs" / generator_system.system_def.id,
                 run_id=run_id,
             )
-            token_totals[generator_def.id] = token_totals.get(generator_def.id, 0) + int(
+            token_totals[generator_system.system_def.id] = token_totals.get(generator_system.system_def.id, 0) + int(
                 (artifacts.metrics or {}).get("total_tokens") or 0
             )
-            generator_run_dir = str(artifacts.run_dir)
             gen_entry: dict[str, Any] = {
-                "run_dir": generator_run_dir,
+                "run_dir": str(artifacts.run_dir),
                 "status": artifacts.status,
                 "error": artifacts.error,
             }
             if artifacts.status != "success" or artifacts.final_output is None:
-                generator_errors += 1
+                generator[generator_system.system_def.id]["errors"] += 1
                 gen_entry["move_san"] = None
-                record["generator"] = gen_entry
-            else:
-                if args.generator_output_field not in artifacts.final_output:
-                    generator_missing_output += 1
-                    gen_entry["move_san"] = None
-                    gen_entry["missing_output_field"] = args.generator_output_field
-                    record["generator"] = gen_entry
-                else:
-                    move_value = artifacts.final_output.get(args.generator_output_field)
-                    if not isinstance(move_value, str) or not move_value.strip():
-                        generator_invalid_move += 1
-                        gen_entry["move_san"] = None
-                        gen_entry["invalid_output"] = move_value
-                        record["generator"] = gen_entry
-                    else:
-                        generator_move = move_value.strip()
-                        generator_oracle_is_legal, generator_oracle_error = _oracle_san_legality(
-                            fen=position.fen, move_san=generator_move
-                        )
-                        generator_oracle_is_legal = bool(generator_oracle_is_legal)
-                        generator_oracle_error = generator_oracle_error
-                        if generator_oracle_error is None:
-                            generator_oracle_parseable += 1
-                        if generator_oracle_is_legal:
-                            generator_oracle_legal += 1
-                        gen_entry["move_san"] = generator_move
-                        gen_entry["oracle_is_legal"] = generator_oracle_is_legal
-                        gen_entry["oracle_error"] = generator_oracle_error
-                        record["generator"] = gen_entry
+                record["generator"][generator_system.system_def.id] = gen_entry
+                continue
+            if args.generator_output_field not in artifacts.final_output:
+                generator[generator_system.system_def.id]["missing_output"] += 1
+                gen_entry["move_san"] = None
+                gen_entry["missing_output_field"] = args.generator_output_field
+                record["generator"][generator_system.system_def.id] = gen_entry
+                continue
+            move_value = artifacts.final_output.get(args.generator_output_field)
+            if not isinstance(move_value, str) or not move_value.strip():
+                generator[generator_system.system_def.id]["invalid_move"] += 1
+                gen_entry["move_san"] = None
+                gen_entry["invalid_output"] = move_value
+                record["generator"][generator_system.system_def.id] = gen_entry
+                continue
+            move_san = move_value.strip()
+            oracle_is_legal, oracle_error = _oracle_san_legality(fen=position.fen, move_san=move_san)
+            if oracle_error is None:
+                generator[generator_system.system_def.id]["oracle_parseable"] += 1
+            if oracle_is_legal:
+                generator[generator_system.system_def.id]["oracle_legal"] += 1
+            gen_entry["move_san"] = move_san
+            gen_entry["oracle_is_legal"] = bool(oracle_is_legal)
+            gen_entry["oracle_error"] = oracle_error
+            record["generator"][generator_system.system_def.id] = gen_entry
+
+        # Pipeline results are only computed when exactly 1 generator + 1 validator are provided.
+        generator_move: Optional[str] = None
+        generator_oracle_is_legal: Optional[bool] = None
+        generator_oracle_error: Optional[str] = None
+        generator_run_dir: Optional[str] = None
+        if pipeline_enabled and record.get("generator"):
+            only_gen_id = generator_systems[0].system_def.id
+            gen_entry = record["generator"].get(only_gen_id, {})
+            generator_move = gen_entry.get("move_san")
+            generator_oracle_is_legal = gen_entry.get("oracle_is_legal")
+            generator_oracle_error = gen_entry.get("oracle_error")
+            generator_run_dir = gen_entry.get("run_dir")
 
         # --- Validator on generator move + pipeline loop (optional) ---
         if pipeline_enabled:
+            generator_def = generator_systems[0].system_def
+            generator_engine = generator_systems[0].engine
+            generator_path = generator_systems[0].system_path
+            validator_def = validator_systems[0].system_def
+            validator_engine = validator_systems[0].engine
+            validator_path = validator_systems[0].system_path
+            if validator_def.id not in validator_on_generator:
+                validator_on_generator[validator_def.id] = {"total": 0, "correct": 0, "errors": 0}
             pipeline_total += 1
             if generator_move is None:
                 pipeline_errors += 1
@@ -479,7 +558,7 @@ def main() -> None:
                 }
             else:
                 # Validator on generator attempt 1.
-                validator_on_generator_total += 1
+                validator_on_generator[validator_def.id]["total"] += 1
                 payload = {
                     "position_fen": position.fen,
                     "candidate_move": generator_move,
@@ -512,7 +591,7 @@ def main() -> None:
                     except Exception as exc:
                         v_entry["parse_error"] = str(exc)
                 if predicted_is_legal is None or generator_oracle_is_legal is None:
-                    validator_on_generator_errors += 1
+                    validator_on_generator[validator_def.id]["errors"] += 1
                     v_entry["predicted_is_legal"] = None
                     v_entry["correct"] = False
                 else:
@@ -520,7 +599,7 @@ def main() -> None:
                     correct = predicted_is_legal == generator_oracle_is_legal
                     v_entry["correct"] = correct
                     if correct:
-                        validator_on_generator_correct += 1
+                        validator_on_generator[validator_def.id]["correct"] += 1
                 record["validator_on_generator"] = v_entry
 
                 # Pipeline: retry generator until validator accepts (or attempts exhausted).
@@ -681,6 +760,32 @@ def main() -> None:
             logger.info("Progress: %s/%s positions", index, args.iterations)
 
     finished_at = datetime.now(timezone.utc).isoformat()
+    generator_summaries: dict[str, Any] = {}
+    for system_id, stats in generator.items():
+        total = stats["total"]
+        generator_summaries[system_id] = {
+            "system_id": system_id,
+            "total": total,
+            "errors": stats["errors"],
+            "missing_output": stats["missing_output"],
+            "invalid_move": stats["invalid_move"],
+            "oracle_parseable": stats["oracle_parseable"],
+            "oracle_legal": stats["oracle_legal"],
+            "oracle_parse_rate": (stats["oracle_parseable"] / total) if total else 0.0,
+            "oracle_legal_rate": (stats["oracle_legal"] / total) if total else 0.0,
+        }
+
+    validator_summaries: dict[str, Any] = {}
+    for system_id, stats in validator_baseline.items():
+        total = stats["total"]
+        validator_summaries[system_id] = {
+            "system_id": system_id,
+            "total": total,
+            "correct": stats["correct"],
+            "errors": stats["errors"],
+            "accuracy": (stats["correct"] / total) if total else 0.0,
+        }
+
     summary = {
         "benchmark_id": benchmark_id,
         "task": "chess_random_suite",
@@ -688,31 +793,19 @@ def main() -> None:
         "plies": args.plies,
         "seed": args.seed,
         "illegal_ratio": args.illegal_ratio,
-        "generator": {
-            "system_id": getattr(generator_def, "id", None),
-            "system_label": getattr(generator_def, "label", None),
-            "total": generator_total,
-            "errors": generator_errors,
-            "missing_output": generator_missing_output,
-            "invalid_move": generator_invalid_move,
-            "oracle_parseable": generator_oracle_parseable,
-            "oracle_legal": generator_oracle_legal,
-            "oracle_parse_rate": (generator_oracle_parseable / generator_total) if generator_total else 0.0,
-            "oracle_legal_rate": (generator_oracle_legal / generator_total) if generator_total else 0.0,
-        },
-        "validator_baseline": {
-            "system_id": getattr(validator_def, "id", None),
-            "system_label": getattr(validator_def, "label", None),
-            "total": validator_baseline_total,
-            "correct": validator_baseline_correct,
-            "errors": validator_baseline_errors,
-            "accuracy": (validator_baseline_correct / validator_baseline_total) if validator_baseline_total else 0.0,
-        },
+        "generators": generator_summaries,
+        "validators": validator_summaries,
         "validator_on_generator": {
-            "total": validator_on_generator_total,
-            "correct": validator_on_generator_correct,
-            "errors": validator_on_generator_errors,
-            "accuracy": (validator_on_generator_correct / validator_on_generator_total) if validator_on_generator_total else 0.0,
+            "enabled": bool(validator_on_generator),
+            "by_system": {
+                system_id: {
+                    "total": stats["total"],
+                    "correct": stats["correct"],
+                    "errors": stats["errors"],
+                    "accuracy": (stats["correct"] / stats["total"]) if stats["total"] else 0.0,
+                }
+                for system_id, stats in validator_on_generator.items()
+            },
         },
         "pipeline": {
             "enabled": pipeline_enabled,
@@ -736,19 +829,54 @@ def main() -> None:
         },
         "finished_at": finished_at,
     }
+    if len(generator_summaries) == 1:
+        system_id, stats = next(iter(generator_summaries.items()))
+        label = next((s.system_def.label for s in generator_systems if s.system_def.id == system_id), None)
+        summary["generator"] = {
+            "system_id": system_id,
+            "system_label": label,
+            "total": stats["total"],
+            "errors": stats["errors"],
+            "missing_output": stats["missing_output"],
+            "invalid_move": stats["invalid_move"],
+            "oracle_parseable": stats["oracle_parseable"],
+            "oracle_legal": stats["oracle_legal"],
+            "oracle_parse_rate": stats["oracle_parse_rate"],
+            "oracle_legal_rate": stats["oracle_legal_rate"],
+        }
+    if len(validator_summaries) == 1:
+        system_id, stats = next(iter(validator_summaries.items()))
+        label = next((s.system_def.label for s in validator_systems if s.system_def.id == system_id), None)
+        summary["validator_baseline"] = {
+            "system_id": system_id,
+            "system_label": label,
+            "total": stats["total"],
+            "correct": stats["correct"],
+            "errors": stats["errors"],
+            "accuracy": stats["accuracy"],
+        }
     _write_json(summary_path, summary)
 
     logger.info("Done.")
-    if generator_total:
+    if summary["generators"]:
         logger.info(
-            "Generator oracle legal rate: %.1f%% (parse rate %.1f%%)",
-            summary["generator"]["oracle_legal_rate"] * 100,
-            summary["generator"]["oracle_parse_rate"] * 100,
+            "Generators: %s",
+            ", ".join(
+                f"{sid} legal={stats['oracle_legal_rate']*100:.1f}% parse={stats['oracle_parse_rate']*100:.1f}%"
+                for sid, stats in summary["generators"].items()
+            ),
         )
-    if validator_baseline_total:
-        logger.info("Validator baseline accuracy: %.1f%%", summary["validator_baseline"]["accuracy"] * 100)
-    if validator_on_generator_total:
-        logger.info("Validator-on-generator accuracy: %.1f%%", summary["validator_on_generator"]["accuracy"] * 100)
+    if validator_summaries:
+        logger.info(
+            "Validators: %s",
+            ", ".join(
+                f"{sid} acc={stats['accuracy']*100:.1f}%"
+                for sid, stats in summary["validators"].items()
+            ),
+        )
+    if validator_on_generator:
+        for system_id, stats in summary["validator_on_generator"]["by_system"].items():
+            logger.info("Validator-on-generator (%s) accuracy: %.1f%%", system_id, stats["accuracy"] * 100)
     if pipeline_total:
         logger.info(
             "Pipeline accept rate: %.1f%% | oracle legal rate: %.1f%% (avg attempts %.2f, false accepts=%s)",

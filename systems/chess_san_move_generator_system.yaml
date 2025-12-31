@@ -49,10 +49,14 @@ nodes:
       FEN: {{ position_fen }}
       Side to move: {{ "white" if position_fen.split(" ")[1] == "w" else "black" }}
       Move notation: SAN
-      {% if attempt %}Attempt: {{ attempt }}{% endif %}
+      {% if attempt %}
+      Attempt: {{ attempt }}
+      {% endif %}
       {% if illegal_moves and illegal_moves|length > 0 %}
       Illegal moves (do not repeat):
-      {% for m in illegal_moves %}- {{ m }}{% endfor %}
+      {% for m in illegal_moves %}
+      - {{ m }}
+      {% endfor %}
       {% endif %}
 
       Respond with minified JSON only:

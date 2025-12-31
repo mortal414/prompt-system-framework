@@ -1,6 +1,0 @@
-{
-  "position_fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-  "candidate_move": "Qh5",
-  "move_context": "Attempting a Scholar's Mate idea without first moving the e-pawn.",
-  "expected_legality": "illegal"
-}
