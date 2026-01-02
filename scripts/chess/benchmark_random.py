@@ -6,8 +6,9 @@ import logging
 import random
 import secrets
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -16,12 +17,20 @@ import chess
 
 from psf.chess_utils import GeneratedPosition, generate_illegal_san, generate_illegal_uci, play_random_plies
 from psf.config_loader import load_system_definition
-from psf.engine import ExecutionEngine, ExecutionResult
-from psf.exceptions import ExecutionError
+from psf.engine import (
+    ContextStore,
+    ExecutionEngine,
+    ExecutionResult,
+    NodeRunRecord,
+    _build_metrics,
+    _handle_structured_output,
+    _normalize_system_input,
+)
+from psf.exceptions import ExecutionError, ProviderError, RecoverableExecutionError
 from psf.logging import RunLogger
-from psf.models import SystemDef
+from psf.models import ModelConfig, NodeDef, SystemDef
 from psf.providers import get_provider
-from psf.providers.openai_provider import OpenAIBatchProvider
+from psf.providers.openai_provider import OpenAIBatchProvider, _batch_entry_to_result
 
 
 @dataclass(frozen=True)
@@ -57,6 +66,60 @@ class PositionOutcome:
     generator: dict[str, dict[str, int]]
     validator_on_generator: dict[str, dict[str, int]]
     pipeline: dict[str, int]
+
+
+@dataclass(frozen=True)
+class SystemTaskOutcome:
+    index: int
+    kind: str
+    system_id: str
+    entry: dict[str, Any]
+    token_totals: dict[str, int]
+    counts: dict[str, dict[str, int]]
+
+
+@dataclass(frozen=True)
+class _BatchTaskSpec:
+    task_id: int
+    kind: str
+    index: int
+    system_def: SystemDef
+    system_path: Path
+    runs_root: Path
+    run_id: str
+    payload: dict[str, Any]
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class _BatchRunState:
+    spec: _BatchTaskSpec
+    engine: ExecutionEngine
+    context: ContextStore
+    run_logger: RunLogger
+    current_node_id: str
+    current_node_attempt: int = 0
+    records: list[NodeRunRecord] = field(default_factory=list)
+    models_used: set[str] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class _PendingNodeCall:
+    state_id: int
+    node: NodeDef
+    prompt: str
+    model_config: ModelConfig
+    attempt: int
+
+
+@dataclass
+class _BatchJobInfo:
+    batch_id: str
+    provider: str
+    model: str
+    request_count: int
+    submitted_at: float
+    custom_ids: list[str]
 
 
 def _setup_logging(*, level: str, log_file: Path | None) -> logging.Logger:
@@ -128,10 +191,6 @@ def _execute_with_run_logger(
     run_id: str,
     provider_resolver: Callable[[str], Any] | None = None,
 ) -> RunArtifacts:
-    runs_root.mkdir(parents=True, exist_ok=True)
-    run_logger = RunLogger(runs_root, system_def, run_id=run_id, use_system_subdir=False)
-    run_logger.snapshot_system()
-    run_logger.snapshot_input(payload)
     try:
         local_engine = ExecutionEngine(system_def, provider_resolver=provider_resolver)
         result = local_engine.run(payload)
@@ -144,6 +203,11 @@ def _execute_with_run_logger(
             metrics={},
             error=str(exc),
         )
+
+    runs_root.mkdir(parents=True, exist_ok=True)
+    run_logger = RunLogger(runs_root, system_def, run_id=run_id, use_system_subdir=False)
+    run_logger.snapshot_system()
+    run_logger.snapshot_input(payload)
     for record in result.node_results:
         run_logger.log_node(record)
     run_logger.finalize(result, config_path=system_path)
@@ -154,6 +218,447 @@ def _execute_with_run_logger(
         error=result.error,
         metrics=result.metrics,
     )
+
+
+def _execute_task_specs_openai_batch(
+    *,
+    task_specs: list[_BatchTaskSpec],
+    openai_batch_provider: OpenAIBatchProvider,
+    batch_size: int,
+    max_wait_seconds: float,
+    poll_interval_seconds: float,
+    logger: logging.Logger,
+) -> Any:
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+
+    pending_results: list[tuple[_BatchTaskSpec, RunArtifacts]] = []
+
+    states: dict[int, _BatchRunState] = {}
+    ready_by_group: dict[tuple[str, str], list[_PendingNodeCall]] = {}
+    last_enqueue_at: dict[tuple[str, str], float] = {}
+
+    def _finalize_state(state_id: int, *, status: str, error_message: str | None, final_output: dict[str, Any] | None) -> None:
+        state = states.pop(state_id)
+        finished_at = datetime.now(timezone.utc)
+        state.context.set_runtime("finished_at", finished_at.isoformat())
+        state.context.set_runtime("status", status)
+        metrics = _build_metrics(state.records, state.models_used)
+        result = ExecutionResult(
+            status=status,
+            final_output=final_output,
+            context=state.context.data,
+            node_results=state.records,
+            metrics=metrics,
+            error=error_message,
+        )
+        state.run_logger.finalize(result, config_path=state.spec.system_path)
+        pending_results.append(
+            (
+                state.spec,
+                RunArtifacts(
+                    run_dir=state.run_logger.run_dir,
+                    status=result.status,
+                    final_output=result.final_output,
+                    error=result.error,
+                    metrics=result.metrics,
+                ),
+            )
+        )
+
+    def _fail_state_with_record(state_id: int, *, node: NodeDef, prompt: str, model_config: ModelConfig, error_message: str, raw_output: str | None) -> None:
+        state = states[state_id]
+        record = NodeRunRecord(node_id=node.id)
+        record.prompt = prompt
+        record.provider = model_config.provider
+        record.model = model_config.model
+        record.raw_output = raw_output
+        record.error = error_message
+        state.records.append(record)
+        state.run_logger.log_node(record)
+        _finalize_state(state_id, status="failure", error_message=error_message, final_output=None)
+
+    def _enqueue_current_node(state_id: int) -> None:
+        state = states[state_id]
+        node = state.spec.system_def.get_node(state.current_node_id)
+        try:
+            inputs = state.engine._resolve_inputs(node, state.context)
+            prompt = state.engine._render_prompt(node, inputs)
+            model_config = state.engine._build_model_config(node)
+        except ExecutionError as exc:
+            record = NodeRunRecord(node_id=node.id)
+            record.error = str(exc)
+            record.provider = node.provider
+            record.model = node.model
+            state.records.append(record)
+            state.run_logger.log_node(record)
+            _finalize_state(state_id, status="failure", error_message=str(exc), final_output=None)
+            return
+
+        attempt = state.current_node_attempt + 1
+        state.current_node_attempt = attempt
+        group_key = (model_config.provider or "openai", model_config.model)
+        ready_by_group.setdefault(group_key, []).append(
+            _PendingNodeCall(
+                state_id=state_id,
+                node=node,
+                prompt=prompt,
+                model_config=model_config,
+                attempt=attempt,
+            )
+        )
+        last_enqueue_at[group_key] = time.monotonic()
+
+    # Initialize run states (and queue their first node call).
+    for spec in task_specs:
+        spec.runs_root.mkdir(parents=True, exist_ok=True)
+        run_logger = RunLogger(spec.runs_root, spec.system_def, run_id=spec.run_id, use_system_subdir=False)
+        run_logger.snapshot_system()
+        run_logger.snapshot_input(spec.payload)
+        try:
+            normalized = _normalize_system_input(spec.system_def, spec.payload)
+        except ExecutionError as exc:
+            result = ExecutionResult(
+                status="failure",
+                final_output=None,
+                context={"runtime": {}},
+                node_results=[],
+                metrics={},
+                error=str(exc),
+            )
+            run_logger.finalize(result, config_path=spec.system_path)
+            pending_results.append(
+                (
+                    spec,
+                    RunArtifacts(
+                        run_dir=run_logger.run_dir,
+                        status=result.status,
+                        final_output=result.final_output,
+                        error=result.error,
+                        metrics=result.metrics,
+                    ),
+                )
+            )
+            while pending_results:
+                yield pending_results.pop()
+            continue
+
+        engine = ExecutionEngine(spec.system_def)
+        context = ContextStore(normalized)
+        context.set_runtime("started_at", datetime.now(timezone.utc).isoformat())
+        states[spec.task_id] = _BatchRunState(
+            spec=spec,
+            engine=engine,
+            context=context,
+            run_logger=run_logger,
+            current_node_id=spec.system_def.entry_node_id,
+        )
+        _enqueue_current_node(spec.task_id)
+        while pending_results:
+            yield pending_results.pop()
+
+    inflight_calls: dict[str, _PendingNodeCall] = {}
+    inflight_jobs: dict[str, _BatchJobInfo] = {}
+
+    def _submit_ready(now: float) -> None:
+        nonlocal inflight_calls, inflight_jobs
+        for group_key, queue in list(ready_by_group.items()):
+            provider_name, model = group_key
+            if provider_name != "openai":
+                for call in list(queue):
+                    state_id = call.state_id
+                    if state_id not in states:
+                        continue
+                    _fail_state_with_record(
+                        state_id,
+                        node=call.node,
+                        prompt=call.prompt,
+                        model_config=call.model_config,
+                        error_message=f"OpenAI batch mode does not support provider '{provider_name}'",
+                        raw_output=None,
+                    )
+                ready_by_group[group_key] = []
+                continue
+
+            while len(queue) >= batch_size:
+                chunk = queue[:batch_size]
+                del queue[:batch_size]
+                _submit_chunk(group_key, chunk, reason="size")
+
+            if queue:
+                last_enq = last_enqueue_at.get(group_key, now)
+                idle_for = now - last_enq
+                if idle_for >= max_wait_seconds:
+                    chunk = list(queue)
+                    queue.clear()
+                    _submit_chunk(group_key, chunk, reason="max_wait")
+
+    def _submit_chunk(group_key: tuple[str, str], chunk: list[_PendingNodeCall], *, reason: str) -> None:
+        provider_name, model = group_key
+        requests: list[dict[str, Any]] = []
+        custom_ids: list[str] = []
+        for call in chunk:
+            custom_id = secrets.token_hex(8)
+            inflight_calls[custom_id] = call
+            custom_ids.append(custom_id)
+            body: dict[str, Any] = {
+                "model": model,
+                "messages": [{"role": "user", "content": call.prompt}],
+            }
+            if call.model_config.temperature is not None:
+                body["temperature"] = call.model_config.temperature
+            if call.model_config.max_tokens is not None:
+                body["max_tokens"] = call.model_config.max_tokens
+            if call.model_config.extra_params:
+                body.update(call.model_config.extra_params)
+            requests.append(
+                {
+                    "custom_id": custom_id,
+                    "method": "POST",
+                    "url": "/v1/chat/completions",
+                    "body": body,
+                }
+            )
+
+        started = time.monotonic()
+        logger.info(
+            "Submitting OpenAI batch (%s): model=%s requests=%s reason=%s",
+            provider_name,
+            model,
+            len(chunk),
+            reason,
+        )
+        input_file_id = openai_batch_provider._upload_batch_file(requests)
+        batch_job = openai_batch_provider._client.batches.create(
+            input_file_id=input_file_id,
+            endpoint="/v1/chat/completions",
+            completion_window="24h",
+        )
+        batch_id = getattr(batch_job, "id", None)
+        if not batch_id:
+            raise ProviderError("OpenAI batch creation returned no id")
+        logger.info(
+            "OpenAI batch created (%s): id=%s model=%s requests=%s",
+            provider_name,
+            batch_id,
+            model,
+            len(chunk),
+        )
+        inflight_jobs[batch_id] = _BatchJobInfo(
+            batch_id=batch_id,
+            provider=provider_name,
+            model=model,
+            request_count=len(chunk),
+            submitted_at=started,
+            custom_ids=custom_ids,
+        )
+
+    while states or inflight_jobs or any(ready_by_group.values()):
+        now = time.monotonic()
+        before_jobs = len(inflight_jobs)
+        _submit_ready(now)
+        submitted_any = len(inflight_jobs) > before_jobs
+        while pending_results:
+            yield pending_results.pop()
+
+        finished_batch_ids: list[str] = []
+        for batch_id, job_info in list(inflight_jobs.items()):
+            batch_job = openai_batch_provider._client.batches.retrieve(batch_id)
+            status = getattr(batch_job, "status", None)
+            if status not in {"completed", "failed", "canceled"}:
+                continue
+            finished_batch_ids.append(batch_id)
+
+            duration = time.monotonic() - job_info.submitted_at
+            logger.info(
+                "OpenAI batch completed (%s): id=%s status=%s model=%s requests=%s duration=%.1fs",
+                job_info.provider,
+                batch_id,
+                status,
+                job_info.model,
+                job_info.request_count,
+                duration,
+            )
+
+            output_file_id = getattr(batch_job, "output_file_id", None)
+            output_lines: list[dict[str, Any]] = []
+            if status == "completed" and output_file_id:
+                output_lines = openai_batch_provider._download_batch_output(output_file_id)
+            responses = {entry.get("custom_id"): entry for entry in output_lines if entry.get("custom_id")}
+
+            for custom_id in job_info.custom_ids:
+                call = inflight_calls.pop(custom_id, None)
+                if call is None:
+                    continue
+                state_id = call.state_id
+                if state_id not in states:
+                    continue
+                state = states[state_id]
+                node = call.node
+                prompt = call.prompt
+                model_config = call.model_config
+
+                entry = responses.get(custom_id)
+                if status != "completed" or entry is None:
+                    if state.current_node_attempt <= node.max_retries:
+                        _enqueue_current_node(state_id)
+                        continue
+                    _fail_state_with_record(
+                        state_id,
+                        node=node,
+                        prompt=prompt,
+                        model_config=model_config,
+                        error_message=f"OpenAI batch request failed (batch_status={status})",
+                        raw_output=None,
+                    )
+                    continue
+
+                response_obj = entry.get("response") or {}
+                status_code = response_obj.get("status_code")
+                if isinstance(status_code, int) and status_code >= 400:
+                    body = response_obj.get("body")
+                    error_text = json.dumps(body, ensure_ascii=False) if body is not None else str(body)
+                    if state.current_node_attempt <= node.max_retries:
+                        _enqueue_current_node(state_id)
+                        continue
+                    _fail_state_with_record(
+                        state_id,
+                        node=node,
+                        prompt=prompt,
+                        model_config=model_config,
+                        error_message=f"OpenAI request failed: {error_text}",
+                        raw_output=None,
+                    )
+                    continue
+
+                try:
+                    llm_result = _batch_entry_to_result(entry)
+                except Exception as exc:
+                    if state.current_node_attempt <= node.max_retries:
+                        _enqueue_current_node(state_id)
+                        continue
+                    _fail_state_with_record(
+                        state_id,
+                        node=node,
+                        prompt=prompt,
+                        model_config=model_config,
+                        error_message=str(exc),
+                        raw_output=None,
+                    )
+                    continue
+
+                raw_text = llm_result.raw_text
+                try:
+                    structured_output = _handle_structured_output(node, raw_text)
+                except RecoverableExecutionError as exc:
+                    if state.current_node_attempt <= node.max_retries:
+                        _enqueue_current_node(state_id)
+                        continue
+                    _fail_state_with_record(
+                        state_id,
+                        node=node,
+                        prompt=prompt,
+                        model_config=model_config,
+                        error_message=str(exc),
+                        raw_output=raw_text,
+                    )
+                    continue
+
+                record = NodeRunRecord(node_id=node.id)
+                record.prompt = prompt
+                record.raw_output = raw_text
+                record.provider = model_config.provider
+                record.model = model_config.model
+                if structured_output is not None:
+                    record.parsed_output = structured_output
+                record.prompt_tokens = llm_result.prompt_tokens
+                record.completion_tokens = llm_result.completion_tokens
+                record.total_tokens = llm_result.total_tokens
+                record.provider_metadata = llm_result.provider_metadata
+                record.duration_ms = duration * 1000.0
+                state.records.append(record)
+                state.run_logger.log_node(record)
+                state.context.set_node_result(
+                    node.id,
+                    raw_output=raw_text,
+                    parsed_output=structured_output,
+                    provider=record.provider,
+                    model=record.model,
+                    tokens={
+                        "prompt": record.prompt_tokens,
+                        "completion": record.completion_tokens,
+                        "total": record.total_tokens,
+                    },
+                    provider_metadata=record.provider_metadata or None,
+                )
+                if record.model:
+                    state.models_used.add(record.model)
+
+                state.current_node_attempt = 0
+                loop_decision = state.engine._handle_loop_control(node, state.context)
+                if getattr(loop_decision, "exhausted", False):
+                    next_node = state.engine._select_next(
+                        node.routing.on_loop_exhausted, structured_output, state.context
+                    )
+                    if next_node is None:
+                        _finalize_state(
+                            state_id,
+                            status="failure",
+                            error_message=f"Loop exhausted for node '{node.id}' without an on_loop_exhausted route",
+                            final_output=None,
+                        )
+                        continue
+                    state.current_node_id = next_node
+                    _enqueue_current_node(state_id)
+                    continue
+                next_node_id = getattr(loop_decision, "next_node_id", None)
+                if next_node_id:
+                    state.current_node_id = next_node_id
+                    _enqueue_current_node(state_id)
+                    continue
+                if node.terminal:
+                    try:
+                        final_output = state.engine._build_system_output(state.context)
+                        _finalize_state(state_id, status="success", error_message=None, final_output=final_output)
+                    except ExecutionError as exc:
+                        _finalize_state(state_id, status="failure", error_message=str(exc), final_output=None)
+                    continue
+                next_node = state.engine._select_next(node.routing.on_success, structured_output, state.context)
+                if next_node is None:
+                    _finalize_state(
+                        state_id,
+                        status="failure",
+                        error_message=f"No routing rule matched after node '{node.id}'",
+                        final_output=None,
+                    )
+                    continue
+                state.current_node_id = next_node
+                _enqueue_current_node(state_id)
+                while pending_results:
+                    yield pending_results.pop()
+
+        for batch_id in finished_batch_ids:
+            inflight_jobs.pop(batch_id, None)
+
+        while pending_results:
+            yield pending_results.pop()
+
+        if not finished_batch_ids and not submitted_any:
+            if inflight_jobs:
+                time.sleep(poll_interval_seconds)
+            elif any(ready_by_group.values()):
+                next_flush_in = poll_interval_seconds
+                for group_key, queue in ready_by_group.items():
+                    if not queue:
+                        continue
+                    last_enq = last_enqueue_at.get(group_key, now)
+                    remaining = max_wait_seconds - (now - last_enq)
+                    if remaining > 0:
+                        next_flush_in = min(next_flush_in, remaining)
+                time.sleep(max(0.01, min(poll_interval_seconds, next_flush_in)))
+
+    while pending_results:
+        yield pending_results.pop()
 
 
 def _coerce_bool(value: Any) -> bool:
@@ -287,7 +792,7 @@ def main() -> None:
         "--openai-batch-max-wait",
         type=float,
         default=0.5,
-        help="Max seconds to wait to fill a batch before flushing.",
+        help="Max seconds to wait after the last queued request before flushing an underfilled batch.",
     )
     parser.add_argument(
         "--openai-batch-poll-interval",
@@ -361,6 +866,12 @@ def main() -> None:
             ValidatorSystem(system_path=resolved, system_def=system_def, move_notation=notation)
         )
 
+    pipeline_enabled = (
+        len(generator_systems) == 1
+        and len(validator_systems) == 1
+        and generator_systems[0].move_notation == validator_systems[0].move_notation
+    )
+
     openai_batch_provider: OpenAIBatchProvider | None = None
     openai_batch_size: int | None = None
     max_workers = 1
@@ -370,9 +881,26 @@ def main() -> None:
             configured_sizes.append(int(getattr(system.system_def, "benchmark_batch_size", 1) or 1))
         inferred_size = max(configured_sizes) if configured_sizes else 2
         openai_batch_size = int(args.openai_batch_size or max(2, inferred_size))
-        max_workers = int(args.max_workers) if args.max_workers else max(openai_batch_size, 4)
+        entry_model_groups: set[tuple[str, str]] = set()
+        for system in [*generator_systems, *validator_systems]:
+            try:
+                entry = system.system_def.get_node(system.system_def.entry_node_id)
+            except Exception:
+                continue
+            provider_name = getattr(entry, "provider", None) or "openai"
+            model_name = getattr(entry, "model", None)
+            if model_name:
+                entry_model_groups.add((provider_name, model_name))
+        parallel_model_groups = max(1, len(entry_model_groups))
+        concurrent_batches = 2
+        tasks_per_position = 1 if pipeline_enabled else max(1, len(generator_systems) + len(validator_systems))
+        total_tasks = args.iterations * tasks_per_position
+        inferred_workers = max(openai_batch_size, 4, openai_batch_size * concurrent_batches * parallel_model_groups)
+        inferred_workers = min(inferred_workers, total_tasks, 2048)
+        max_workers = int(args.max_workers) if args.max_workers else int(inferred_workers)
         openai_batch_provider = OpenAIBatchProvider(
             batch_size=openai_batch_size,
+            logger=logger,
             max_wait_seconds=float(args.openai_batch_max_wait),
             poll_interval_seconds=float(args.openai_batch_poll_interval),
         )
@@ -508,12 +1036,6 @@ def main() -> None:
     pipeline_total_attempts = 0
 
     token_totals: dict[str, int] = {}
-
-    pipeline_enabled = (
-        len(generator_systems) == 1
-        and len(validator_systems) == 1
-        and generator_systems[0].move_notation == validator_systems[0].move_notation
-    )
     if generator_systems and validator_systems and not pipeline_enabled:
         if len(generator_systems) != 1 or len(validator_systems) != 1:
             logger.info("Pipeline mode disabled (requires exactly 1 generator and 1 validator).")
@@ -981,7 +1503,457 @@ def main() -> None:
         pipeline_total_attempts += int(outcome.pipeline.get("total_attempts", 0))
         _append_jsonl(results_path, outcome.record)
 
-    if max_workers > 1:
+    def _consume_task_outcome(outcome: SystemTaskOutcome, record_by_index: dict[int, dict[str, Any]]) -> None:
+        _merge_token_totals(token_totals, outcome.token_totals)
+        if outcome.kind == "validator_baseline":
+            _merge_nested_counts(validator_baseline, outcome.counts)
+            record_by_index[outcome.index]["validator_baseline"][outcome.system_id] = outcome.entry
+        elif outcome.kind == "generator":
+            _merge_nested_counts(generator, outcome.counts)
+            record_by_index[outcome.index]["generator"][outcome.system_id] = outcome.entry
+        else:
+            raise ValueError(f"Unknown task kind '{outcome.kind}'")
+
+    def _run_validator_baseline_task(
+        index: int,
+        position: GeneratedPosition,
+        validator: ValidatorSystem,
+    ) -> SystemTaskOutcome:
+        candidate_san, candidate_uci = baseline_candidates[index]
+        candidate_move = candidate_uci if validator.move_notation == "uci" else candidate_san
+        expected_is_legal, expected_error = _oracle_legality(
+            fen=position.fen,
+            move=candidate_move,
+            notation=validator.move_notation,
+        )
+        expected_legality = "legal" if expected_is_legal else "illegal"
+
+        payload = {
+            "position_fen": position.fen,
+            "candidate_move": candidate_move,
+            "move_notation": validator.move_notation,
+            "expected_legality": expected_legality,
+        }
+        run_id = f"pos{index:04d}_validator_baseline"
+        artifacts = _execute_with_run_logger(
+            system_def=validator.system_def,
+            system_path=validator.system_path,
+            payload=payload,
+            runs_root=benchmark_dir / "psf_runs" / validator.system_def.id,
+            run_id=run_id,
+            provider_resolver=_provider_resolver,
+        )
+        token_delta = {
+            validator.system_def.id: int((artifacts.metrics or {}).get("total_tokens") or 0),
+        }
+
+        baseline_entry: dict[str, Any] = {
+            "candidate_move": candidate_move,
+            "move_notation": validator.move_notation,
+            "expected_is_legal": expected_is_legal,
+            "expected_error": expected_error,
+            "run_dir": str(artifacts.run_dir),
+            "status": artifacts.status,
+            "error": artifacts.error,
+        }
+
+        predicted_is_legal: Optional[bool] = None
+        correct_count = 0
+        error_count = 0
+        if artifacts.status == "success" and artifacts.final_output is not None:
+            try:
+                predicted_is_legal = _coerce_bool(artifacts.final_output.get(args.validator_output_field))
+            except Exception as exc:
+                baseline_entry["parse_error"] = str(exc)
+        if predicted_is_legal is None:
+            error_count = 1
+            baseline_entry["predicted_is_legal"] = None
+            baseline_entry["correct"] = False
+        else:
+            baseline_entry["predicted_is_legal"] = predicted_is_legal
+            is_correct = predicted_is_legal == expected_is_legal
+            baseline_entry["correct"] = is_correct
+            if is_correct:
+                correct_count = 1
+
+        counts = {
+            validator.system_def.id: {
+                "total": 1,
+                "correct": correct_count,
+                "errors": error_count,
+            }
+        }
+        return SystemTaskOutcome(
+            index=index,
+            kind="validator_baseline",
+            system_id=validator.system_def.id,
+            entry=baseline_entry,
+            token_totals=token_delta,
+            counts=counts,
+        )
+
+    def _run_generator_task(
+        index: int,
+        position: GeneratedPosition,
+        generator_system: GeneratorSystem,
+    ) -> SystemTaskOutcome:
+        payload = {
+            "position_fen": position.fen,
+            "move_notation": generator_system.move_notation,
+            "illegal_moves": [],
+            "attempt": 1,
+        }
+        run_id = f"pos{index:04d}_generator"
+        artifacts = _execute_with_run_logger(
+            system_def=generator_system.system_def,
+            system_path=generator_system.system_path,
+            payload=payload,
+            runs_root=benchmark_dir / "psf_runs" / generator_system.system_def.id,
+            run_id=run_id,
+            provider_resolver=_provider_resolver,
+        )
+
+        system_id = generator_system.system_def.id
+        token_delta = {
+            system_id: int((artifacts.metrics or {}).get("total_tokens") or 0),
+        }
+        counts = {
+            system_id: {
+                "total": 1,
+                "errors": 0,
+                "missing_output": 0,
+                "invalid_move": 0,
+                "oracle_parseable": 0,
+                "oracle_legal": 0,
+            }
+        }
+
+        gen_entry: dict[str, Any] = {
+            "run_dir": str(artifacts.run_dir),
+            "status": artifacts.status,
+            "error": artifacts.error,
+            "move_notation": generator_system.move_notation,
+            "move_output_field": generator_system.move_output_field,
+        }
+        if artifacts.status != "success" or artifacts.final_output is None:
+            counts[system_id]["errors"] = 1
+            gen_entry["move"] = None
+            return SystemTaskOutcome(
+                index=index,
+                kind="generator",
+                system_id=system_id,
+                entry=gen_entry,
+                token_totals=token_delta,
+                counts=counts,
+            )
+        if generator_system.move_output_field not in artifacts.final_output:
+            counts[system_id]["missing_output"] = 1
+            gen_entry["move"] = None
+            gen_entry["missing_output_field"] = generator_system.move_output_field
+            return SystemTaskOutcome(
+                index=index,
+                kind="generator",
+                system_id=system_id,
+                entry=gen_entry,
+                token_totals=token_delta,
+                counts=counts,
+            )
+        move_value = artifacts.final_output.get(generator_system.move_output_field)
+        if not isinstance(move_value, str) or not move_value.strip():
+            counts[system_id]["invalid_move"] = 1
+            gen_entry["move"] = None
+            gen_entry["invalid_output"] = move_value
+            return SystemTaskOutcome(
+                index=index,
+                kind="generator",
+                system_id=system_id,
+                entry=gen_entry,
+                token_totals=token_delta,
+                counts=counts,
+            )
+        move = move_value.strip()
+        oracle_is_legal, oracle_error = _oracle_legality(
+            fen=position.fen,
+            move=move,
+            notation=generator_system.move_notation,
+        )
+        if oracle_error is None:
+            counts[system_id]["oracle_parseable"] = 1
+        if oracle_is_legal:
+            counts[system_id]["oracle_legal"] = 1
+
+        gen_entry["move"] = move
+        if generator_system.move_notation == "uci":
+            gen_entry["move_uci"] = move
+        else:
+            gen_entry["move_san"] = move
+        gen_entry["oracle_is_legal"] = bool(oracle_is_legal)
+        gen_entry["oracle_error"] = oracle_error
+
+        return SystemTaskOutcome(
+            index=index,
+            kind="generator",
+            system_id=system_id,
+            entry=gen_entry,
+            token_totals=token_delta,
+            counts=counts,
+        )
+
+    use_openai_batch_scheduler = openai_batch_provider is not None and not pipeline_enabled
+    if use_openai_batch_scheduler:
+        tasks_per_position = len(generator_systems) + len(validator_systems)
+        logger.info(
+            "Batch scheduler: stage-based; tasks=%s (positions=%s × systems=%s) batch_size=%s",
+            args.iterations * tasks_per_position,
+            args.iterations,
+            tasks_per_position,
+            openai_batch_size,
+        )
+        record_by_index: dict[int, dict[str, Any]] = {}
+        remaining_tasks: dict[int, int] = {}
+        for idx, position in enumerate(positions, start=1):
+            record: dict[str, Any] = {
+                "index": idx,
+                "position_fen": position.fen,
+                "meta": {
+                    "move_history_san": position.move_history_san,
+                    "move_history_uci": position.move_history_uci,
+                },
+            }
+            if validator_systems:
+                record["validator_baseline"] = {}
+            if generator_systems:
+                record["generator"] = {}
+            record_by_index[idx] = record
+            remaining_tasks[idx] = tasks_per_position
+
+        task_specs: list[_BatchTaskSpec] = []
+        task_id = 0
+        for idx, position in enumerate(positions, start=1):
+            if validator_systems:
+                candidate_san, candidate_uci = baseline_candidates[idx]
+                for validator in validator_systems:
+                    candidate_move = candidate_uci if validator.move_notation == "uci" else candidate_san
+                    expected_is_legal, expected_error = _oracle_legality(
+                        fen=position.fen,
+                        move=candidate_move,
+                        notation=validator.move_notation,
+                    )
+                    expected_legality = "legal" if expected_is_legal else "illegal"
+                    payload = {
+                        "position_fen": position.fen,
+                        "candidate_move": candidate_move,
+                        "move_notation": validator.move_notation,
+                        "expected_legality": expected_legality,
+                    }
+                    task_id += 1
+                    task_specs.append(
+                        _BatchTaskSpec(
+                            task_id=task_id,
+                            kind="validator_baseline",
+                            index=idx,
+                            system_def=validator.system_def,
+                            system_path=validator.system_path,
+                            runs_root=benchmark_dir / "psf_runs" / validator.system_def.id,
+                            run_id=f"pos{idx:04d}_validator_baseline",
+                            payload=payload,
+                            metadata={
+                                "candidate_move": candidate_move,
+                                "move_notation": validator.move_notation,
+                                "expected_is_legal": expected_is_legal,
+                                "expected_error": expected_error,
+                            },
+                        )
+                    )
+            for generator_system in generator_systems:
+                payload = {
+                    "position_fen": position.fen,
+                    "move_notation": generator_system.move_notation,
+                    "illegal_moves": [],
+                    "attempt": 1,
+                }
+                task_id += 1
+                task_specs.append(
+                    _BatchTaskSpec(
+                        task_id=task_id,
+                        kind="generator",
+                        index=idx,
+                        system_def=generator_system.system_def,
+                        system_path=generator_system.system_path,
+                        runs_root=benchmark_dir / "psf_runs" / generator_system.system_def.id,
+                        run_id=f"pos{idx:04d}_generator",
+                        payload=payload,
+                        metadata={
+                            "move_notation": generator_system.move_notation,
+                            "move_output_field": generator_system.move_output_field,
+                        },
+                    )
+                )
+
+        ready_to_write: dict[int, dict[str, Any]] = {}
+        next_to_write = 1
+        written = 0
+
+        def _outcome_from_run(*, spec: _BatchTaskSpec, artifacts: RunArtifacts) -> SystemTaskOutcome:
+            if spec.kind == "validator_baseline":
+                system_id = spec.system_def.id
+                token_delta = {system_id: int((artifacts.metrics or {}).get("total_tokens") or 0)}
+                candidate_move = spec.metadata.get("candidate_move")
+                move_notation = spec.metadata.get("move_notation")
+                expected_is_legal = bool(spec.metadata.get("expected_is_legal"))
+                expected_error = spec.metadata.get("expected_error")
+                baseline_entry: dict[str, Any] = {
+                    "candidate_move": candidate_move,
+                    "move_notation": move_notation,
+                    "expected_is_legal": expected_is_legal,
+                    "expected_error": expected_error,
+                    "run_dir": str(artifacts.run_dir),
+                    "status": artifacts.status,
+                    "error": artifacts.error,
+                }
+                predicted_is_legal: Optional[bool] = None
+                correct_count = 0
+                error_count = 0
+                if artifacts.status == "success" and artifacts.final_output is not None:
+                    try:
+                        predicted_is_legal = _coerce_bool(artifacts.final_output.get(args.validator_output_field))
+                    except Exception as exc:
+                        baseline_entry["parse_error"] = str(exc)
+                if predicted_is_legal is None:
+                    error_count = 1
+                    baseline_entry["predicted_is_legal"] = None
+                    baseline_entry["correct"] = False
+                else:
+                    baseline_entry["predicted_is_legal"] = predicted_is_legal
+                    is_correct = predicted_is_legal == expected_is_legal
+                    baseline_entry["correct"] = is_correct
+                    if is_correct:
+                        correct_count = 1
+                counts = {system_id: {"total": 1, "correct": correct_count, "errors": error_count}}
+                return SystemTaskOutcome(
+                    index=spec.index,
+                    kind="validator_baseline",
+                    system_id=system_id,
+                    entry=baseline_entry,
+                    token_totals=token_delta,
+                    counts=counts,
+                )
+
+            if spec.kind == "generator":
+                system_id = spec.system_def.id
+                token_delta = {system_id: int((artifacts.metrics or {}).get("total_tokens") or 0)}
+                move_notation = spec.metadata.get("move_notation")
+                move_output_field = spec.metadata.get("move_output_field")
+                counts = {
+                    system_id: {
+                        "total": 1,
+                        "errors": 0,
+                        "missing_output": 0,
+                        "invalid_move": 0,
+                        "oracle_parseable": 0,
+                        "oracle_legal": 0,
+                    }
+                }
+                gen_entry: dict[str, Any] = {
+                    "run_dir": str(artifacts.run_dir),
+                    "status": artifacts.status,
+                    "error": artifacts.error,
+                    "move_notation": move_notation,
+                    "move_output_field": move_output_field,
+                }
+                if artifacts.status != "success" or artifacts.final_output is None:
+                    counts[system_id]["errors"] = 1
+                    gen_entry["move"] = None
+                    return SystemTaskOutcome(
+                        index=spec.index,
+                        kind="generator",
+                        system_id=system_id,
+                        entry=gen_entry,
+                        token_totals=token_delta,
+                        counts=counts,
+                    )
+                if move_output_field not in artifacts.final_output:
+                    counts[system_id]["missing_output"] = 1
+                    gen_entry["move"] = None
+                    gen_entry["missing_output_field"] = move_output_field
+                    return SystemTaskOutcome(
+                        index=spec.index,
+                        kind="generator",
+                        system_id=system_id,
+                        entry=gen_entry,
+                        token_totals=token_delta,
+                        counts=counts,
+                    )
+                move_value = artifacts.final_output.get(move_output_field)
+                if not isinstance(move_value, str) or not move_value.strip():
+                    counts[system_id]["invalid_move"] = 1
+                    gen_entry["move"] = None
+                    gen_entry["invalid_output"] = move_value
+                    return SystemTaskOutcome(
+                        index=spec.index,
+                        kind="generator",
+                        system_id=system_id,
+                        entry=gen_entry,
+                        token_totals=token_delta,
+                        counts=counts,
+                    )
+                move = move_value.strip()
+                fen = spec.payload.get("position_fen")
+                oracle_is_legal, oracle_error = _oracle_legality(
+                    fen=str(fen),
+                    move=move,
+                    notation=str(move_notation),
+                )
+                if oracle_error is None:
+                    counts[system_id]["oracle_parseable"] = 1
+                if oracle_is_legal:
+                    counts[system_id]["oracle_legal"] = 1
+                gen_entry["move"] = move
+                if move_notation == "uci":
+                    gen_entry["move_uci"] = move
+                else:
+                    gen_entry["move_san"] = move
+                gen_entry["oracle_is_legal"] = bool(oracle_is_legal)
+                gen_entry["oracle_error"] = oracle_error
+                return SystemTaskOutcome(
+                    index=spec.index,
+                    kind="generator",
+                    system_id=system_id,
+                    entry=gen_entry,
+                    token_totals=token_delta,
+                    counts=counts,
+                )
+
+            raise ValueError(f"Unknown task kind '{spec.kind}'")
+
+        if openai_batch_size is None:
+            raise RuntimeError("openai_batch_size is required when OpenAI batch scheduler is enabled")
+        for spec, artifacts in _execute_task_specs_openai_batch(
+            task_specs=task_specs,
+            openai_batch_provider=openai_batch_provider,
+            batch_size=openai_batch_size,
+            max_wait_seconds=float(args.openai_batch_max_wait),
+            poll_interval_seconds=float(args.openai_batch_poll_interval),
+            logger=logger,
+        ):
+            outcome = _outcome_from_run(spec=spec, artifacts=artifacts)
+            _consume_task_outcome(outcome, record_by_index)
+            remaining_tasks[outcome.index] -= 1
+            if remaining_tasks[outcome.index] == 0:
+                ready_to_write[outcome.index] = record_by_index[outcome.index]
+            while next_to_write in ready_to_write:
+                _append_jsonl(results_path, ready_to_write.pop(next_to_write))
+                written += 1
+                if args.progress_every > 0 and written % args.progress_every == 0:
+                    logger.info("Progress: %s/%s positions", written, args.iterations)
+                next_to_write += 1
+        while next_to_write in ready_to_write:
+            _append_jsonl(results_path, ready_to_write.pop(next_to_write))
+            written += 1
+            if args.progress_every > 0 and written % args.progress_every == 0:
+                logger.info("Progress: %s/%s positions", written, args.iterations)
+            next_to_write += 1
+    elif max_workers > 1:
         futures = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for idx, position in enumerate(positions, start=1):

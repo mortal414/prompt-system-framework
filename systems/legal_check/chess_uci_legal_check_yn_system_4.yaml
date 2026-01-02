@@ -1,0 +1,137 @@
+id: "chess_uci_legal_check_yn_system_4"
+label: "Chess UCI Legal Check (Y/N, Context-Heavy)"
+version: "0.1.0"
+entry_node_id: "ask_legality_yn"
+benchmark_batch_size: 100
+
+system_input:
+  fields:
+    position_fen:
+      type: string
+      required: true
+      description: "Board state in Forsyth–Edwards Notation (full FEN, 6 fields)"
+    candidate_move:
+      type: string
+      required: true
+      description: "Candidate move in UCI (e.g. e2e4, e7e8q, e1g1)"
+    move_context:
+      type: string
+      required: false
+      description: "Optional notes or intent"
+    move_notation:
+      type: string
+      required: false
+      description: "Move notation tag (uci)"
+    expected_legality:
+      type: string
+      required: false
+      description: "Optional ground-truth tag (legal/illegal) for testing"
+
+system_output:
+  fields:
+    is_legal:
+      from: "node.parse_legality_yn.output.is_legal"
+    verdict:
+      from: "node.parse_legality_yn.output.verdict"
+    reason:
+      from: "node.parse_legality_yn.output.reason"
+
+nodes:
+  - id: "ask_legality_yn"
+    label: "Ask legality as Y/N (context-heavy)"
+    provider: "openai"
+    model: "gpt-4o"
+    temperature: 0.0
+    max_tokens: 32
+    instructions: |
+      You are a strict chess arbiter.
+      Determine whether the candidate move is legal in the exact FEN position.
+
+      The move is in UCI coordinate notation:
+      - Normal: <from><to> (e2e4)
+      - Promotion: <from><to><piece> where piece is one of q/r/b/n in lowercase (e7e8q)
+      - Castling is the king move: e1g1, e1c1, e8g8, e8c8
+
+      Critical legality requirements:
+      - Correct side to move.
+      - The from-square contains your piece; the to-square is not occupied by your own piece.
+      - Movement rules + clear path (for sliders) + correct capture rules.
+      - Special moves: castling rights + squares empty + king not in/through check; en passant only to the EP target; promotions only from 7th→8th (white) / 2nd→1st (black).
+      - The move must not leave your king in check.
+
+      Reply with exactly one character: "Y" (legal) or "N" (illegal). No other text.
+    prompt_template: |
+      FEN: {{ position_fen }}
+      FEN breakdown:
+      - Pieces: {{ position_fen.split(" ")[0] }}
+      - Side to move: {{ "white" if position_fen.split(" ")[1] == "w" else "black" }}
+      - Castling rights: {{ position_fen.split(" ")[2] }}
+      - En passant target: {{ position_fen.split(" ")[3] }}
+      - Halfmove clock: {{ position_fen.split(" ")[4] }}
+      - Fullmove number: {{ position_fen.split(" ")[5] }}
+
+      MOVE (UCI): {{ candidate_move }}
+      Move breakdown:
+      - from: {{ candidate_move[0:2] }}
+      - to: {{ candidate_move[2:4] }}
+      - promotion: {{ candidate_move[4] if candidate_move|length > 4 else "-" }}
+      {% if move_context %}
+      Context: {{ move_context }}
+      {% endif %}
+
+      Is the move legal given the game state? (Y/N)
+    input_bindings:
+      position_fen:
+        from: "system.position_fen"
+      candidate_move:
+        from: "system.candidate_move"
+      move_context:
+        from: "system.move_context"
+        required: false
+    output_mode: "raw"
+    routing:
+      on_success:
+        - next: "parse_legality_yn"
+
+  - id: "parse_legality_yn"
+    label: "Parse Y/N verdict"
+    provider: "openai"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 128
+    instructions: |
+      Convert the raw verdict into strict JSON.
+      Rules:
+      - If the first non-whitespace token starts with "Y" (e.g. "Y", "Yes"), is_legal=true and verdict="Y".
+      - If it starts with "N" (e.g. "N", "No"), is_legal=false and verdict="N".
+      - If it starts with "L" (e.g. "Legal"), is_legal=true and verdict="Y".
+      - If it starts with "I" (e.g. "Illegal"), is_legal=false and verdict="N".
+      - Otherwise, is_legal=false and verdict="N".
+      - reason must be a short, neutral phrase (do not restate the full position).
+    prompt_template: |
+      Raw verdict:
+      {{ raw_verdict }}
+
+      Respond with minified JSON:
+      {
+        "is_legal": true|false,
+        "verdict": "Y"|"N",
+        "reason": "<short phrase>"
+      }
+    input_bindings:
+      raw_verdict:
+        from: "node.ask_legality_yn.raw_output"
+    output_mode: "structured"
+    output_schema:
+      type: object
+      properties:
+        is_legal:
+          type: boolean
+        verdict:
+          type: string
+          enum: ["Y", "N"]
+        reason:
+          type: string
+      required: [is_legal, verdict, reason]
+    terminal: true
+

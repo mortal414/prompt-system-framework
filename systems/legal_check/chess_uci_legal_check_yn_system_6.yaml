@@ -1,0 +1,127 @@
+id: "chess_uci_legal_check_yn_system_6"
+label: "Chess UCI Legal Check (Y/N, Verdict+Reason)"
+version: "0.1.0"
+entry_node_id: "ask_legality_yn"
+benchmark_batch_size: 100
+
+system_input:
+  fields:
+    position_fen:
+      type: string
+      required: true
+      description: "Board state in Forsyth–Edwards Notation (full FEN, 6 fields)"
+    candidate_move:
+      type: string
+      required: true
+      description: "Candidate move in UCI (e.g. e2e4, e7e8q, e1g1)"
+    move_context:
+      type: string
+      required: false
+      description: "Optional notes or intent"
+    move_notation:
+      type: string
+      required: false
+      description: "Move notation tag (uci)"
+    expected_legality:
+      type: string
+      required: false
+      description: "Optional ground-truth tag (legal/illegal) for testing"
+
+system_output:
+  fields:
+    is_legal:
+      from: "node.parse_legality_yn.output.is_legal"
+    verdict:
+      from: "node.parse_legality_yn.output.verdict"
+    reason:
+      from: "node.parse_legality_yn.output.reason"
+
+nodes:
+  - id: "ask_legality_yn"
+    label: "Ask legality as Y/N with short reason"
+    provider: "openai"
+    model: "gpt-4o"
+    temperature: 0.0
+    max_tokens: 64
+    instructions: |
+      You are a strict chess arbiter.
+      Determine if the candidate move is legal in the exact position provided.
+      The move is in UCI notation (e.g. e2e4, e7e8q, e1g1).
+
+      Output format (single line):
+      - If legal: "Y - <very short reason>"
+      - If illegal: "N - <very short reason>"
+
+      The first character must be "Y" or "N" (uppercase).
+    prompt_template: |
+      FEN: {{ position_fen }}
+      Side to move: {{ "white" if position_fen.split(" ")[1] == "w" else "black" }}
+      Castling rights: {{ position_fen.split(" ")[2] }}
+      En passant target: {{ position_fen.split(" ")[3] }}
+      MOVE (UCI): {{ candidate_move }}
+      From: {{ candidate_move[0:2] }}
+      To: {{ candidate_move[2:4] }}
+      Promotion: {{ candidate_move[4] if candidate_move|length > 4 else "-" }}
+      {% if move_context %}
+      Context: {{ move_context }}
+      {% endif %}
+
+      Is the move legal given the game state? (Y/N)
+    input_bindings:
+      position_fen:
+        from: "system.position_fen"
+      candidate_move:
+        from: "system.candidate_move"
+      move_context:
+        from: "system.move_context"
+        required: false
+    output_mode: "raw"
+    routing:
+      on_success:
+        - next: "parse_legality_yn"
+
+  - id: "parse_legality_yn"
+    label: "Parse verdict + reason"
+    provider: "openai"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 128
+    instructions: |
+      Convert the raw verdict into strict JSON.
+      Rules:
+      - If the first non-whitespace token starts with "Y" (e.g. "Y", "Yes"), is_legal=true and verdict="Y".
+      - If it starts with "N" (e.g. "N", "No"), is_legal=false and verdict="N".
+      - If it starts with "L" (e.g. "Legal"), is_legal=true and verdict="Y".
+      - If it starts with "I" (e.g. "Illegal"), is_legal=false and verdict="N".
+      - Otherwise, is_legal=false and verdict="N".
+
+      reason:
+      - If raw_verdict contains a short explanation after the first token (e.g. "Y - ..."), use it (trimmed) as reason.
+      - Otherwise, produce a short, neutral phrase.
+    prompt_template: |
+      Raw verdict:
+      {{ raw_verdict }}
+
+      Respond with minified JSON:
+      {
+        "is_legal": true|false,
+        "verdict": "Y"|"N",
+        "reason": "<short phrase>"
+      }
+    input_bindings:
+      raw_verdict:
+        from: "node.ask_legality_yn.raw_output"
+    output_mode: "structured"
+    output_schema:
+      type: object
+      properties:
+        is_legal:
+          type: boolean
+        verdict:
+          type: string
+          enum: ["Y", "N"]
+        reason:
+          type: string
+      required: [is_legal, verdict, reason]
+    terminal: true
+

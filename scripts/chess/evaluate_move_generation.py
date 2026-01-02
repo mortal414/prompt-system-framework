@@ -104,10 +104,6 @@ def _run_system_with_psf_logging(
     run_id: str,
     provider_resolver: Callable[[str], Any] | None = None,
 ) -> tuple[str, Optional[dict[str, Any]], Optional[str], str]:
-    runs_root.mkdir(parents=True, exist_ok=True)
-    run_logger = RunLogger(runs_root, system_def, run_id=run_id, use_system_subdir=False)
-    run_logger.snapshot_system()
-    run_logger.snapshot_input(payload)
     try:
         local_engine = ExecutionEngine(system_def, provider_resolver=provider_resolver)
         result = local_engine.run(payload)
@@ -120,6 +116,11 @@ def _run_system_with_psf_logging(
             metrics={},
             error=str(exc),
         )
+
+    runs_root.mkdir(parents=True, exist_ok=True)
+    run_logger = RunLogger(runs_root, system_def, run_id=run_id, use_system_subdir=False)
+    run_logger.snapshot_system()
+    run_logger.snapshot_input(payload)
     for record in result.node_results:
         run_logger.log_node(record)
     run_logger.finalize(result, config_path=system_path)
@@ -232,7 +233,7 @@ def main() -> None:
         "--openai-batch-max-wait",
         type=float,
         default=0.5,
-        help="Max seconds to wait to fill a batch before flushing.",
+        help="Max seconds to wait after the last queued request before flushing an underfilled batch.",
     )
     parser.add_argument(
         "--openai-batch-poll-interval",
@@ -315,9 +316,27 @@ def main() -> None:
             configured_sizes.append(int(getattr(validator_system_def, "benchmark_batch_size", 1) or 1))
         inferred_size = max(configured_sizes) if configured_sizes else 2
         openai_batch_size = int(args.openai_batch_size or max(2, inferred_size))
-        max_workers = int(args.max_workers) if args.max_workers else max(openai_batch_size, 4)
+        entry_model_groups: set[tuple[str, str]] = set()
+        for candidate_def in [system_def, validator_system_def]:
+            if candidate_def is None:
+                continue
+            try:
+                entry = candidate_def.get_node(candidate_def.entry_node_id)
+            except Exception:
+                continue
+            provider_name = getattr(entry, "provider", None) or "openai"
+            model_name = getattr(entry, "model", None)
+            if model_name:
+                entry_model_groups.add((provider_name, model_name))
+        parallel_model_groups = max(1, len(entry_model_groups))
+        concurrent_batches = 2
+        total_tasks = len(scenarios) * args.iterations
+        inferred_workers = max(openai_batch_size, 4, openai_batch_size * concurrent_batches * parallel_model_groups)
+        inferred_workers = min(inferred_workers, total_tasks, 2048)
+        max_workers = int(args.max_workers) if args.max_workers else int(inferred_workers)
         openai_batch_provider = OpenAIBatchProvider(
             batch_size=openai_batch_size,
+            logger=logger,
             max_wait_seconds=float(args.openai_batch_max_wait),
             poll_interval_seconds=float(args.openai_batch_poll_interval),
         )

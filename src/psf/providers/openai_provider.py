@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import tempfile
@@ -89,8 +90,8 @@ class OpenAIBatchProvider(LLMProvider):
     """
     Batch-enabled provider that submits chat completions via the OpenAI Batch API.
 
-    Requests are grouped by (provider, model) and flushed when the batch_size is reached
-    or when max_wait_seconds elapses for the oldest pending request.
+    Requests are grouped by (provider, model) and flushed when enough requests are queued
+    to fill a batch, or when max_wait_seconds passes without any new requests (idle flush).
     """
 
     name = "openai"
@@ -100,6 +101,7 @@ class OpenAIBatchProvider(LLMProvider):
         *,
         batch_size: int,
         client: Any | None = None,
+        logger: logging.Logger | None = None,
         max_wait_seconds: float = 0.5,
         poll_interval_seconds: float = 1.0,
     ) -> None:
@@ -107,10 +109,12 @@ class OpenAIBatchProvider(LLMProvider):
             raise ProviderError("batch_size must be >= 1")
         self._client = client or OpenAIProvider._build_default_client()
         self._batch_size = batch_size
+        self._logger = logger or logging.getLogger("psf.providers.openai.batch")
         self._max_wait = max_wait_seconds
         self._poll_interval = poll_interval_seconds
         self._locks: Dict[Tuple[str, str], threading.Condition] = {}
         self._queues: Dict[Tuple[str, str], List["_PendingRequest"]] = {}
+        self._last_enqueue_at: Dict[Tuple[str, str], float] = {}
 
     def complete(self, prompt: str, config: ModelConfig) -> LLMResult:
         key = (config.provider or "openai", config.model)
@@ -119,38 +123,45 @@ class OpenAIBatchProvider(LLMProvider):
         with condition:
             queue = self._queues.setdefault(key, [])
             queue.append(request)
-            should_flush = len(queue) >= self._batch_size
-            if not should_flush:
-                # Wait for more requests up to max_wait; oldest waiter flushes whatever exists.
-                condition.wait(timeout=self._max_wait)
+            self._last_enqueue_at[key] = request.enqueued_at
+            condition.notify_all()
+
+            while not request.completed:
                 queue = self._queues.setdefault(key, [])
-                if not request.completed and queue and request is queue[0]:
-                    should_flush = True
-            if should_flush and queue:
-                batch = list(queue)
-                queue.clear()
-                # Release lock while performing network I/O
-                condition.release()
-                try:
-                    self._flush_batch(key, batch)
-                finally:
-                    condition.acquire()
-                condition.notify_all()
-            else:
-                # Another thread is expected to flush; wait for result
-                while not request.completed:
+                if not queue:
                     condition.wait(timeout=self._max_wait)
-                    if not request.completed and queue and request is queue[0]:
-                        # Safety: flush if nobody else did
-                        batch = list(queue)
-                        queue.clear()
-                        condition.release()
-                        try:
-                            self._flush_batch(key, batch)
-                        finally:
-                            condition.acquire()
-                        condition.notify_all()
-                        break
+                    continue
+
+                should_flush = False
+                reason = "unknown"
+                if len(queue) >= self._batch_size:
+                    should_flush = True
+                    reason = "size"
+                elif queue[0] is request:
+                    last_enqueue = self._last_enqueue_at.get(key, request.enqueued_at)
+                    idle_for = time.monotonic() - last_enqueue
+                    if idle_for >= self._max_wait:
+                        should_flush = True
+                        reason = "max_wait"
+
+                if should_flush:
+                    batch_len = min(self._batch_size, len(queue))
+                    batch = queue[:batch_len]
+                    del queue[:batch_len]
+                    condition.release()
+                    try:
+                        self._flush_batch(key, batch, reason=reason)
+                    finally:
+                        condition.acquire()
+                    condition.notify_all()
+                    continue
+
+                timeout = self._max_wait
+                if queue[0] is request:
+                    last_enqueue = self._last_enqueue_at.get(key, request.enqueued_at)
+                    idle_for = time.monotonic() - last_enqueue
+                    timeout = max(0.0, self._max_wait - idle_for)
+                condition.wait(timeout=timeout)
 
         if request.error:
             raise request.error
@@ -158,7 +169,13 @@ class OpenAIBatchProvider(LLMProvider):
             raise ProviderError("Batch request completed without a result")
         return request.result
 
-    def _flush_batch(self, key: Tuple[str, str], batch: List["_PendingRequest"]) -> None:
+    def _flush_batch(
+        self,
+        key: Tuple[str, str],
+        batch: List["_PendingRequest"],
+        *,
+        reason: str,
+    ) -> None:
         requests: list[dict[str, Any]] = []
         for req in batch:
             body: dict[str, Any] = {
@@ -180,6 +197,15 @@ class OpenAIBatchProvider(LLMProvider):
                 }
             )
 
+        started = time.monotonic()
+        provider_name, model = key
+        self._logger.info(
+            "Submitting OpenAI batch (%s): model=%s requests=%s reason=%s",
+            provider_name,
+            model,
+            len(batch),
+            reason,
+        )
         try:
             input_file_id = self._upload_batch_file(requests)
             batch_job = self._client.batches.create(
@@ -187,12 +213,31 @@ class OpenAIBatchProvider(LLMProvider):
                 endpoint="/v1/chat/completions",
                 completion_window="24h",
             )
+            batch_id = getattr(batch_job, "id", None)
+            if batch_id:
+                self._logger.info(
+                    "OpenAI batch created (%s): id=%s model=%s requests=%s",
+                    provider_name,
+                    batch_id,
+                    model,
+                    len(batch),
+                )
             batch_job = self._wait_for_batch(batch_job.id)
             if getattr(batch_job, "status", None) != "completed":
                 raise ProviderError(f"Batch job failed with status '{getattr(batch_job, 'status', None)}'")
             output_file_id = getattr(batch_job, "output_file_id", None)
             if not output_file_id:
                 raise ProviderError("Batch completed without output_file_id")
+            duration = time.monotonic() - started
+            self._logger.info(
+                "OpenAI batch completed (%s): id=%s status=%s model=%s requests=%s duration=%.1fs",
+                provider_name,
+                getattr(batch_job, "id", None),
+                getattr(batch_job, "status", None),
+                model,
+                len(batch),
+                duration,
+            )
             output_lines = self._download_batch_output(output_file_id)
             responses = {entry["custom_id"]: entry for entry in output_lines}
             for req in batch:
@@ -267,6 +312,7 @@ class _PendingRequest:
         self.prompt = prompt
         self.config = config
         self.custom_id = secrets.token_hex(8)
+        self.enqueued_at = time.monotonic()
         self.result: LLMResult | None = None
         self.error: ProviderError | None = None
         self.completed: bool = False
