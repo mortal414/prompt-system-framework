@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -14,15 +15,39 @@ SUPPORTED_CONFIG_EXTENSIONS = {".yaml", ".yml", ".json"}
 
 
 def load_system_definition(path: str | Path) -> SystemDef:
-    path = Path(path)
+    cache: dict[Path, SystemDef] = {}
+    return _load_system_definition_internal(Path(path), cache=cache, stack=[])
+
+
+def _load_system_definition_internal(
+    path: Path,
+    *,
+    cache: dict[Path, SystemDef],
+    stack: list[Path],
+) -> SystemDef:
+    path = path.expanduser()
+    if not path.is_absolute():
+        path = path.resolve()
     if not path.exists():
         raise ConfigError(f"System definition not found: {path}")
+
+    path = path.resolve()
+    if path in stack:
+        cycle = " -> ".join([*map(str, stack), str(path)])
+        raise ConfigError(f"Detected system include cycle: {cycle}")
+    cached = cache.get(path)
+    if cached is not None:
+        return cached
+
     raw_config = _load_raw_config(path)
+    _resolve_use_system_paths(raw_config, base_dir=path.parent)
     try:
         system = SystemDef.model_validate(raw_config)
     except ValidationError as exc:  # pragma: no cover - pydantic formatting is complex
         raise ConfigError(f"Invalid system definition: {exc}") from exc
     _validate_cross_references(system)
+    cache[path] = system
+    _validate_nested_system_nodes(system, system_path=path, cache=cache, stack=[*stack, path])
     return system
 
 
@@ -42,6 +67,59 @@ def _load_raw_config(path: Path) -> Any:
     if not isinstance(data, dict):
         raise ConfigError("Top-level system definition must be an object/dict")
     return data
+
+
+def _resolve_use_system_paths(raw_config: dict[str, Any], *, base_dir: Path) -> None:
+    nodes = raw_config.get("nodes")
+    if not isinstance(nodes, list):
+        return
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        use_system = node.get("use_system")
+        if use_system is None:
+            continue
+        if not isinstance(use_system, str) or not use_system.strip():
+            raise ConfigError("use_system must be a non-empty path string")
+        expanded = os.path.expandvars(use_system.strip())
+        p = Path(expanded).expanduser()
+        if not p.is_absolute():
+            candidates = [
+                (base_dir / p),
+                (base_dir.parent / p),
+                (Path.cwd() / p),
+            ]
+            chosen: Path | None = None
+            for candidate in candidates:
+                if candidate.exists():
+                    chosen = candidate
+                    break
+            p = (chosen or candidates[0]).resolve()
+        else:
+            p = p.resolve()
+        node["use_system"] = str(p)
+
+
+def _validate_nested_system_nodes(
+    system: SystemDef,
+    *,
+    system_path: Path,
+    cache: dict[Path, SystemDef],
+    stack: list[Path],
+) -> None:
+    for node in system.nodes:
+        if not node.use_system:
+            continue
+        include_path = Path(node.use_system).expanduser().resolve()
+        if not include_path.exists():
+            raise ConfigError(f"node '{node.id}' use_system not found: {include_path}")
+        included = _load_system_definition_internal(include_path, cache=cache, stack=stack)
+        required_inputs = {name for name, field in included.system_input.fields.items() if field.required}
+        missing = sorted(required_inputs - set(node.input_bindings.keys()))
+        if missing:
+            raise ConfigError(
+                f"node '{node.id}' missing bindings for required subsystem inputs: {', '.join(missing)}"
+            )
 
 
 def _validate_cross_references(system: SystemDef) -> None:

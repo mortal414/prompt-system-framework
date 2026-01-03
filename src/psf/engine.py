@@ -113,10 +113,13 @@ class ExecutionEngine:
         system: SystemDef,
         *,
         provider_resolver: Callable[[str], LLMProvider] | None = None,
+        system_loader: Callable[[str], SystemDef] | None = None,
     ) -> None:
         self.system = system
         self._provider_resolver = provider_resolver or get_provider
+        self._system_loader = system_loader
         self._node_index = system.node_index()
+        self._subsystem_cache: dict[str, SystemDef] = {}
 
     def run(self, system_input: Optional[dict[str, Any]] = None) -> ExecutionResult:
         normalized_input = _normalize_system_input(self.system, system_input or {})
@@ -140,6 +143,11 @@ class ExecutionEngine:
                 break
             if record.model:
                 models_used.add(record.model)
+            subsystem_models = record.provider_metadata.get("subsystem_models_used") if record.provider_metadata else None
+            if isinstance(subsystem_models, list):
+                for model in subsystem_models:
+                    if isinstance(model, str) and model:
+                        models_used.add(model)
             loop_decision = self._handle_loop_control(node, context)
             if loop_decision.exhausted:
                 next_node = self._select_next(node.routing.on_loop_exhausted, structured_output, context)
@@ -189,6 +197,8 @@ class ExecutionEngine:
         record = NodeRunRecord(node_id=node.id)
         start_time = time.perf_counter()
         try:
+            if node.use_system:
+                return self._execute_system_node(node, context, record)
             inputs = self._resolve_inputs(node, context)
             prompt = self._render_prompt(node, inputs)
             record.prompt = prompt
@@ -228,6 +238,92 @@ class ExecutionEngine:
             return record, None
         finally:
             record.duration_ms = (time.perf_counter() - start_time) * 1000
+
+    def _execute_system_node(
+        self,
+        node: NodeDef,
+        context: ContextStore,
+        record: NodeRunRecord,
+    ) -> tuple[NodeRunRecord, Optional[dict[str, Any]]]:
+        if not node.use_system:
+            raise ExecutionError(f"Node '{node.id}' is not a system node")
+
+        inputs = self._resolve_inputs(node, context)
+        record.prompt = f"CALL_SYSTEM path={node.use_system}"
+        record.provider = "system"
+        record.model = None
+
+        subsystem = self._load_subsystem(node.use_system)
+
+        attempts = node.max_retries + 1
+        last_error: str | None = None
+        last_result: ExecutionResult | None = None
+        completed_attempts = 0
+        for attempt in range(1, attempts + 1):
+            completed_attempts = attempt
+            try:
+                last_result = ExecutionEngine(
+                    subsystem,
+                    provider_resolver=self._provider_resolver,
+                    system_loader=self._system_loader,
+                ).run(inputs)
+            except ExecutionError as exc:
+                last_error = str(exc)
+                last_result = None
+            else:
+                last_error = last_result.error
+                if last_result.status == "success" and last_result.final_output is not None:
+                    break
+
+        record.provider_metadata = {
+            "subsystem_path": node.use_system,
+            "subsystem_id": subsystem.id,
+            "subsystem_attempts": completed_attempts,
+            "subsystem_status": last_result.status if last_result else "failure",
+            "subsystem_error": last_error,
+            "subsystem_metrics": last_result.metrics if last_result else None,
+            "subsystem_models_used": (last_result.metrics or {}).get("models_used") if last_result else None,
+        }
+
+        if last_result is None or last_result.status != "success" or last_result.final_output is None:
+            record.error = f"Subsystem '{subsystem.id}' failed: {last_error or 'unknown error'}"
+            return record, None
+
+        structured_output = last_result.final_output
+        record.parsed_output = structured_output
+
+        metrics = last_result.metrics or {}
+        record.prompt_tokens = metrics.get("total_prompt_tokens")
+        record.completion_tokens = metrics.get("total_completion_tokens")
+        record.total_tokens = metrics.get("total_tokens")
+
+        context.set_node_result(
+            node.id,
+            raw_output=None,
+            parsed_output=structured_output,
+            provider=record.provider,
+            model=record.model,
+            tokens={
+                "prompt": record.prompt_tokens,
+                "completion": record.completion_tokens,
+                "total": record.total_tokens,
+            },
+            provider_metadata=record.provider_metadata or None,
+        )
+        return record, structured_output
+
+    def _load_subsystem(self, use_system: str) -> SystemDef:
+        cached = self._subsystem_cache.get(use_system)
+        if cached is not None:
+            return cached
+        loader = self._system_loader
+        if loader is None:
+            from .config_loader import load_system_definition
+
+            loader = lambda path: load_system_definition(path)  # type: ignore[assignment]
+        subsystem = loader(use_system)
+        self._subsystem_cache[use_system] = subsystem
+        return subsystem
 
     def _resolve_inputs(self, node: NodeDef, context: ContextStore) -> dict[str, Any]:
         resolved: dict[str, Any] = {}

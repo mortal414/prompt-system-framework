@@ -108,7 +108,14 @@ def inspect(system: str = typer.Option(..., "--system", help="Path to system def
     typer.echo("")
     typer.echo("Nodes:")
     for node in system_def.nodes:
-        typer.echo(f"- {node.id} | label={node.label or '-'} | provider={node.provider or '<default>'} | model={node.model or '<default>'}")
+        if getattr(node, "use_system", None):
+            typer.echo(
+                f"- {node.id} | label={node.label or '-'} | kind=system | use_system={node.use_system}"
+            )
+        else:
+            typer.echo(
+                f"- {node.id} | label={node.label or '-'} | kind=llm | provider={node.provider or '<default>'} | model={node.model or '<default>'}"
+            )
         if node.loop_control:
             typer.echo(
                 f"  loop -> target={node.loop_control.loop_target_node} max={node.loop_control.max_iterations} exit_on_success={node.loop_control.exit_on_success}"

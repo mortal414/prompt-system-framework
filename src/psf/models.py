@@ -86,13 +86,16 @@ class LoopControl(BaseModel):
 class NodeDef(BaseModel):
     id: str
     label: Optional[str] = None
+    # If set, this node executes another system (loaded from a separate YAML/JSON file)
+    # and exposes that system's final_output under node.<id>.output.
+    use_system: Optional[str] = None
     provider: Optional[str] = None
     model: Optional[str] = None
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     extra_params: Dict[str, Any] = Field(default_factory=dict)
-    instructions: str
-    prompt_template: str
+    instructions: str = ""
+    prompt_template: str = ""
     input_bindings: Dict[str, InputBinding] = Field(default_factory=dict)
     output_mode: OutputMode = "raw"
     output_schema: Optional[Dict[str, Any]] = None
@@ -103,12 +106,16 @@ class NodeDef(BaseModel):
 
     @model_validator(mode="after")
     def _validate_output_schema(self) -> "NodeDef":
+        if self.use_system:
+            return self
         if self.output_mode in {"structured", "both"} and not self.output_schema:
             raise ValueError("Structured output nodes must define output_schema")
         return self
 
     @model_validator(mode="after")
     def _trim_prompts(self) -> "NodeDef":
+        if self.use_system:
+            return self
         if not self.instructions.strip():
             raise ValueError("instructions must not be empty")
         if not self.prompt_template.strip():
@@ -117,10 +124,40 @@ class NodeDef(BaseModel):
 
     @model_validator(mode="after")
     def _ensure_model(self) -> "NodeDef":
+        if self.use_system:
+            return self
         if not self.model:
             raise ValueError("node must specify a model")
         if not self.provider:
             self.provider = "openai"
+        return self
+
+    @model_validator(mode="after")
+    def _validate_use_system(self) -> "NodeDef":
+        if not self.use_system:
+            return self
+
+        if not isinstance(self.use_system, str) or not self.use_system.strip():
+            raise ValueError("use_system must be a non-empty path string")
+
+        forbidden_fields = {
+            "provider": self.provider,
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "extra_params": self.extra_params,
+        }
+        forbidden_set = [name for name, value in forbidden_fields.items() if value not in (None, {}, "")]
+        if forbidden_set:
+            raise ValueError(f"system node must not set: {', '.join(sorted(forbidden_set))}")
+
+        # System nodes don't invoke an LLM directly; output_schema/output_mode are not meaningful.
+        if self.output_schema is not None:
+            raise ValueError("system node must not define output_schema")
+        if self.output_mode != "raw":
+            raise ValueError("system node must not set output_mode (subsystem output is always structured)")
+        if self.instructions.strip() or self.prompt_template.strip():
+            raise ValueError("system node must not set instructions/prompt_template")
         return self
 
 

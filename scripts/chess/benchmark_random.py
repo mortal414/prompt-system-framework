@@ -1699,7 +1699,14 @@ def main() -> None:
             counts=counts,
         )
 
-    use_openai_batch_scheduler = openai_batch_provider is not None and not pipeline_enabled
+    has_system_nodes = any(
+        getattr(node, "use_system", None)
+        for system in [*generator_systems, *validator_systems]
+        for node in system.system_def.nodes
+    )
+    use_openai_batch_scheduler = openai_batch_provider is not None and not pipeline_enabled and not has_system_nodes
+    if openai_batch_provider is not None and has_system_nodes:
+        logger.info("OpenAI batch scheduler disabled (system nodes detected); using threaded execution instead.")
     if use_openai_batch_scheduler:
         tasks_per_position = len(generator_systems) + len(validator_systems)
         logger.info(

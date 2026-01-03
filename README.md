@@ -227,12 +227,12 @@ Prompt-System.md    # Concept primer for systems of prompts
 - Keep prompts focused; lean on **structured outputs** and schema validation instead of long natural-language instructions.  
 - Specify **provider/model per node** (no global defaults) so batching and multi-model systems stay explicit.  
 - Use **input bindings** to pass only what each node needs, and prefer system inputs over re-querying the model.  
+- Reuse existing systems via **system nodes** (`use_system: path/to/other_system.yaml`) to avoid duplicating prompts (see `docs/system-composition.md`).  
 - Add **routing conditions** for happy/sad paths and **loop controls** for controlled retries.  
 - Populate **descriptions** in system inputs/outputs to make `inspect` easier for others.  
 - Capture a **baseline benchmark** whenever you change prompts to detect regressions.
 
 ## Next steps
-- System within System!  
 - Expand provider layer (multi-provider support, custom params).  
 - Introduce richer routing (JMESPath/JSONPath) and better testing utilities.  
 - Build the planned UI atop these explicit configs once the engine stabilizes.

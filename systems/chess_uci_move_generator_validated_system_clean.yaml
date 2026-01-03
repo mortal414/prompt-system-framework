@@ -91,7 +91,7 @@ nodes:
         required: false
         default: 0
       last_illegal_reason:
-        from: "node.parse_legality_yn.output.reason"
+        from: "node.validate_legality.output.reason"
         required: false
         default: ""
     output_mode: "structured"
@@ -103,25 +103,11 @@ nodes:
       required: [move_uci]
     routing:
       on_success:
-        - next: "ask_legality_yn"
+        - next: "validate_legality"
 
-  - id: "ask_legality_yn"
-    label: "Validate UCI legality (Y/N)"
-    provider: "openai"
-    model: "gpt-4o"
-    temperature: 0.0
-    max_tokens: 32
-    max_retries: 2
-    instructions: |
-      You are a strict chess arbiter.
-      Determine if the candidate move is legal in the exact position provided.
-      The move is in UCI notation (e.g. e2e4, e7e8q, e1g1).
-      Reply with exactly one character: "Y" (legal) or "N" (illegal). No other text.
-    prompt_template: |
-      FEN: {{ position_fen }}
-      MOVE (UCI): {{ candidate_move }}
-
-      Is the move legal given the game state? (Y/N)
+  - id: "validate_legality"
+    label: "Validate UCI legality (reused system)"
+    use_system: "systems/legal_check/chess_uci_legal_check_yn_system_1.yaml"
     input_bindings:
       position_fen:
         from: "system.position_fen"
@@ -130,52 +116,8 @@ nodes:
       move_context:
         from: "system.move_context"
         required: false
-    output_mode: "raw"
-    routing:
-      on_success:
-        - next: "parse_legality_yn"
-
-  - id: "parse_legality_yn"
-    label: "Parse Y/N verdict"
-    provider: "openai"
-    model: "gpt-4o-mini"
-    temperature: 0.0
-    max_tokens: 128
-    max_retries: 2
-    instructions: |
-      Convert the raw verdict into strict JSON.
-      Rules:
-      - If the first non-whitespace token starts with "Y" (e.g. "Y", "Yes"), is_legal=true and verdict="Y".
-      - If it starts with "N" (e.g. "N", "No"), is_legal=false and verdict="N".
-      - If it starts with "L" (e.g. "Legal"), is_legal=true and verdict="Y".
-      - If it starts with "I" (e.g. "Illegal"), is_legal=false and verdict="N".
-      - Otherwise, is_legal=false and verdict="N".
-      - reason must be a short, neutral phrase (do not restate the full position).
-    prompt_template: |
-      Raw verdict:
-      {{ raw_verdict }}
-
-      Respond with minified JSON:
-      {
-        "is_legal": true|false,
-        "verdict": "Y"|"N",
-        "reason": "<short phrase>"
-      }
-    input_bindings:
-      raw_verdict:
-        from: "node.ask_legality_yn.raw_output"
-    output_mode: "structured"
-    output_schema:
-      type: object
-      properties:
-        is_legal:
-          type: boolean
-        verdict:
-          type: string
-          enum: ["Y", "N"]
-        reason:
-          type: string
-      required: [is_legal, verdict, reason]
+      move_notation:
+        value: "uci"
     routing:
       on_success:
         - condition: "output.is_legal == true"
@@ -209,7 +151,7 @@ nodes:
       new_illegal_move:
         from: "node.propose_move.output.move_uci"
       reason:
-        from: "node.parse_legality_yn.output.reason"
+        from: "node.validate_legality.output.reason"
         required: false
         default: ""
     output_mode: "structured"
