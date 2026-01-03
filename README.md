@@ -232,7 +232,6 @@ Prompt-System.md    # Concept primer for systems of prompts
 - Capture a **baseline benchmark** whenever you change prompts to detect regressions.
 
 ## Next steps
-- Batches!  
 - System within System!  
 - Expand provider layer (multi-provider support, custom params).  
 - Introduce richer routing (JMESPath/JSONPath) and better testing utilities.  
