@@ -79,16 +79,22 @@ class ContextStore:
         model: Optional[str],
         tokens: dict[str, Optional[int]],
         provider_metadata: Optional[dict[str, Any]] = None,
+        error: Optional[str] = None,
     ) -> None:
         bucket = self._data.setdefault("node", {}).setdefault(node_id, {})
         bucket["raw_output"] = raw_output
         if parsed_output is not None:
             bucket["output"] = parsed_output
+        else:
+            bucket.pop("output", None)
+        bucket["error"] = error
         bucket["provider"] = provider
         bucket["model"] = model
         bucket["tokens"] = tokens
-        if provider_metadata:
+        if provider_metadata is not None:
             bucket["provider_metadata"] = provider_metadata
+        else:
+            bucket.pop("provider_metadata", None)
         self._data["runtime"].setdefault("node_history", []).append(node_id)
         self._data["runtime"]["last_node_id"] = node_id
 
@@ -138,6 +144,10 @@ class ExecutionEngine:
             record, structured_output = self._execute_node(node, context)
             records.append(record)
             if record.error:
+                next_node = self._select_next(node.routing.on_failure, structured_output, context)
+                if next_node is not None:
+                    current_node_id = next_node
+                    continue
                 status = "failure"
                 error_message = record.error
                 break
@@ -226,15 +236,44 @@ class ExecutionEngine:
                     "total": record.total_tokens,
                 },
                 provider_metadata=record.provider_metadata or None,
+                error=None,
             )
             return record, structured_output
         except NodeExecutionError as exc:
             if exc.raw_output is not None:
                 record.raw_output = exc.raw_output
             record.error = str(exc)
+            context.set_node_result(
+                node.id,
+                raw_output=record.raw_output,
+                parsed_output=None,
+                provider=record.provider,
+                model=record.model,
+                tokens={
+                    "prompt": record.prompt_tokens,
+                    "completion": record.completion_tokens,
+                    "total": record.total_tokens,
+                },
+                provider_metadata=record.provider_metadata or None,
+                error=record.error,
+            )
             return record, None
         except ExecutionError as exc:
             record.error = str(exc)
+            context.set_node_result(
+                node.id,
+                raw_output=record.raw_output,
+                parsed_output=None,
+                provider=record.provider,
+                model=record.model,
+                tokens={
+                    "prompt": record.prompt_tokens,
+                    "completion": record.completion_tokens,
+                    "total": record.total_tokens,
+                },
+                provider_metadata=record.provider_metadata or None,
+                error=record.error,
+            )
             return record, None
         finally:
             record.duration_ms = (time.perf_counter() - start_time) * 1000
@@ -287,6 +326,20 @@ class ExecutionEngine:
 
         if last_result is None or last_result.status != "success" or last_result.final_output is None:
             record.error = f"Subsystem '{subsystem.id}' failed: {last_error or 'unknown error'}"
+            context.set_node_result(
+                node.id,
+                raw_output=None,
+                parsed_output=None,
+                provider=record.provider,
+                model=record.model,
+                tokens={
+                    "prompt": record.prompt_tokens,
+                    "completion": record.completion_tokens,
+                    "total": record.total_tokens,
+                },
+                provider_metadata=record.provider_metadata or None,
+                error=record.error,
+            )
             return record, None
 
         structured_output = last_result.final_output
@@ -309,6 +362,7 @@ class ExecutionEngine:
                 "total": record.total_tokens,
             },
             provider_metadata=record.provider_metadata or None,
+            error=None,
         )
         return record, structured_output
 

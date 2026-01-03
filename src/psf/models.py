@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 OutputMode = Literal["raw", "structured", "both"]
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class ModelConfig(BaseModel):
@@ -103,6 +106,14 @@ class NodeDef(BaseModel):
     loop_control: Optional[LoopControl] = None
     terminal: bool = False
     max_retries: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_id(self) -> "NodeDef":
+        if not _IDENTIFIER_RE.match(self.id):
+            raise ValueError(
+                "node id must match /^[A-Za-z_][A-Za-z0-9_]*$/ (required for context paths and routing conditions)"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_output_schema(self) -> "NodeDef":

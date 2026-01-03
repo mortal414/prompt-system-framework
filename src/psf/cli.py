@@ -132,6 +132,44 @@ def inspect(system: str = typer.Option(..., "--system", help="Path to system def
 
 
 @app.command()
+def schema(
+    out: Optional[str] = typer.Option(None, "--out", help="Write JSON schema to a file (defaults to stdout)"),
+) -> None:
+    """Print the JSON schema for the canonical SystemDef model."""
+    from .models import SystemDef
+
+    payload = SystemDef.model_json_schema()
+    if out:
+        out_path = Path(out).expanduser().resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False)
+        typer.echo(f"Wrote schema to: {out_path}")
+        return
+    typer.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+@app.command()
+def graph(
+    system: str = typer.Option(..., "--system", help="Path to system definition"),
+    out: Optional[str] = typer.Option(None, "--out", help="Write graph JSON to a file (defaults to stdout)"),
+) -> None:
+    """Export a machine-readable graph for a system (includes resolved use_system)."""
+    system_path = _resolve_path(system)
+    from .graph import export_resolved_graph
+
+    payload = export_resolved_graph(system_path)
+    if out:
+        out_path = Path(out).expanduser().resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False)
+        typer.echo(f"Wrote graph to: {out_path}")
+        return
+    typer.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+@app.command()
 def run(
     system: str = typer.Option(..., "--system", help="Path to system definition"),
     input: Optional[str] = typer.Option(None, "--input", help="Path to input JSON/YAML"),

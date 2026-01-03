@@ -2,6 +2,11 @@
 
 This project evaluates prompt systems on chess tasks using **full FEN (6 fields)** as the canonical board state. The initial focus is **legal move generation** with **SAN** and **UCI**.
 
+## Benchmark entrypoints
+
+- **Contract / general-purpose**: `psf benchmark` (labeled scenario directory → accuracy summaries). Artifact layout is documented in `docs/runs-and-artifacts.md`.
+- **Chess example utilities**: `scripts/chess/*` (random-position suites, scenario generation, oracle evaluation). These scripts may write additional summary files and are not part of the stable benchmark contract, but they still embed standard PSF per-run directories for inspection.
+
 ## Common input fields (recommended)
 
 - `position_fen` (string, required): Full FEN, e.g. `"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"`.
@@ -22,7 +27,7 @@ Baseline chess systems in this repo generally only *use* `position_fen` (and `il
 
 ## Script: random benchmark suite (`scripts/chess/benchmark_random.py`)
 
-Preferred entrypoint when you want to generate **random positions on the fly** and treat **`--iterations` as “number of games/positions”** (each position is evaluated once).
+Use when you want to generate **random positions on the fly** and treat **`--iterations` as “number of games/positions”** (each position is evaluated once).
 
 It can run:
 
