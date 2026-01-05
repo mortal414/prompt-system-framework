@@ -23,7 +23,7 @@ Baseline chess systems in this repo generally only *use* `position_fen` (and `il
 - `systems/chess_san_move_generator_system.yaml`: minimal SAN move generator that outputs `move_san`.
 - `systems/chess_san_move_generator_validated_system.yaml`: self-validated generator (generate → legal check → retry with `illegal_moves` up to 5 times; after 5 illegal attempts, force-accept the next move). Outputs `move_san` plus `trusted_by_validator`, `illegal_attempts`, and `illegal_moves`.
 - `systems/chess_uci_move_generator_system.yaml`: minimal UCI move generator that outputs `move_uci`.
-- `systems/chess_uci_move_generator_validated_system.yaml`: self-validated UCI generator (generate → validator Y/N → retry up to 5 illegal moves, then force-accept). Outputs `move_uci` plus `trusted_by_validator`, `illegal_attempts`, and `illegal_moves`.
+- `systems/chess_uci_move_generator_validated_system.yaml`: validated UCI generator (generate → parse → validator Y/N → parse). Outputs `move_uci` plus legality (`is_legal`, `verdict`, `reason`) and carries forward `illegal_moves`/`illegal_attempts` for external retry loops.
 
 ## Script: random benchmark suite (`scripts/chess/benchmark_random.py`)
 
@@ -104,7 +104,7 @@ Generator-only (self-validated system):
   --generator-system systems/chess_san_move_generator_validated_system.yaml
 ```
 
-Generator-only (UCI, self-validated system):
+Generator-only (UCI, validated system):
 
 ```bash
 .venv/bin/python scripts/chess/benchmark_random.py \
