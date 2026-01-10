@@ -227,7 +227,7 @@ def main() -> None:
         "--openai-batch-size",
         type=int,
         default=None,
-        help="Requests per OpenAI batch job (default: max of system benchmark_batch_size).",
+        help="Requests per OpenAI batch job (default: 2).",
     )
     parser.add_argument(
         "--openai-batch-max-wait",
@@ -256,7 +256,7 @@ def main() -> None:
     if args.progress_every < 0:
         raise SystemExit("--progress-every must be >= 0")
     if args.openai_batch_size is not None and args.openai_batch_size < 2:
-        raise SystemExit("--openai-batch-size must be >= 2 (or omit for auto)")
+        raise SystemExit("--openai-batch-size must be >= 2 (omit to use default)")
     if args.openai_batch_max_wait <= 0:
         raise SystemExit("--openai-batch-max-wait must be > 0")
     if args.openai_batch_poll_interval <= 0:
@@ -311,11 +311,7 @@ def main() -> None:
     openai_batch_size: int | None = None
     max_workers = 1
     if args.openai_batch:
-        configured_sizes = [int(getattr(system_def, "benchmark_batch_size", 1) or 1)]
-        if validator_system_def is not None:
-            configured_sizes.append(int(getattr(validator_system_def, "benchmark_batch_size", 1) or 1))
-        inferred_size = max(configured_sizes) if configured_sizes else 2
-        openai_batch_size = int(args.openai_batch_size or max(2, inferred_size))
+        openai_batch_size = int(args.openai_batch_size or 2)
         entry_model_groups: set[tuple[str, str]] = set()
         for candidate_def in [system_def, validator_system_def]:
             if candidate_def is None:

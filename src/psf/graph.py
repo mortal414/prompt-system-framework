@@ -77,7 +77,6 @@ def _export_system(system: SystemDef, *, system_path: Path, systems: dict[Path, 
         "label": system.label,
         "version": system.version,
         "entry_node_id": system.entry_node_id,
-        "benchmark_batch_size": system.benchmark_batch_size,
         "system_input": system.system_input.model_dump(exclude_none=True),
         "system_output": system.system_output.model_dump(by_alias=True, exclude_none=True),
         "nodes": nodes,
@@ -162,4 +161,3 @@ def _export_routing_edges(node: NodeDef) -> list[dict[str, Any]]:
                 }
             )
     return edges
-

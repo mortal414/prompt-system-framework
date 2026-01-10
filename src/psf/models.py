@@ -180,7 +180,6 @@ class SystemDef(BaseModel):
     system_input: SystemInputConfig = Field(default_factory=SystemInputConfig)
     system_output: SystemOutputConfig
     nodes: List[NodeDef]
-    benchmark_batch_size: int = Field(default=1, ge=1)
 
     @model_validator(mode="after")
     def _validate_structure(self) -> "SystemDef":

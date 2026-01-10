@@ -202,6 +202,7 @@ def benchmark(
     inputs_dir: Optional[str] = typer.Option(None, "--inputs-dir", help="Directory containing benchmark input files"),
     input: Optional[List[str]] = typer.Option(None, "--input", "-i", help="Specific input file (repeatable)"),
     iterations: int = typer.Option(5, "--iterations", min=1, help="Number of runs per scenario"),
+    batch_size: int = typer.Option(1, "--batch-size", min=1, help="Requests per OpenAI batch job (OpenAI only)"),
     expect_field: str = typer.Option("expected_legality", "--expect-field", help="Input field containing the expected legality label"),
     output_field: str = typer.Option("is_legal", "--output-field", help="System output field to compare"),
     run_dir: str = typer.Option(DEFAULT_RUN_DIR, "--run-dir", help="Directory to store per-iteration artifacts"),
@@ -232,6 +233,7 @@ def benchmark(
                 system_path=system_path,
                 scenarios=scenarios,
                 iterations=iterations,
+                batch_size=batch_size,
                 output_field=output_field,
                 suite_root=suite_root,
                 benchmark_id=benchmark_id,
@@ -282,6 +284,18 @@ def replay(
         run_logger.log_node(record)
     run_logger.finalize(result)
     _print_execution_result(result, run_logger.run_dir)
+
+
+@app.command()
+def ui(
+    host: str = typer.Option("127.0.0.1", "--host", help="Host interface for the UI server"),
+    port: int = typer.Option(8321, "--port", help="Port for the UI server"),
+) -> None:
+    """Run the local PSF UI server."""
+    from .ui.server import serve
+
+    typer.echo(f"Starting PSF UI at http://{host}:{port}")
+    serve(host=host, port=port)
 
 
 def _execute_system(engine: ExecutionEngine, payload: dict[str, Any]) -> ExecutionResult:
@@ -407,6 +421,7 @@ def _run_benchmark_for_system(
     system_path: Path,
     scenarios: List[BenchmarkScenario],
     iterations: int,
+    batch_size: int,
     output_field: str,
     suite_root: Path,
     benchmark_id: str,
@@ -415,7 +430,7 @@ def _run_benchmark_for_system(
     benchmark_root = suite_root / system_def.id
     benchmark_root.mkdir(parents=True, exist_ok=False)
     started_at = datetime.now(timezone.utc)
-    batch_size = max(1, system_def.benchmark_batch_size or 1)
+    batch_size = max(1, batch_size)
     use_batch = batch_size > 1
     batch_provider: OpenAIBatchProvider | None = None
     if use_batch:

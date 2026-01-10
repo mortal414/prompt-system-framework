@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PSF Workbench</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link href="https://cdn.jsdelivr.net/npm/vis-network/styles/vis-network.min.css" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="ambient"></div>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">PSF</div>
+        <div>
+          <div class="brand-name">Prompt System Workbench</div>
+          <div class="brand-subtitle">Local benchmarks and system graph builder</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <button class="nav-btn active" data-view="benchmarks">Benchmarks</button>
+        <button class="nav-btn" data-view="builder">System Builder</button>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="status">
+          <span class="status-dot"></span>
+          <span id="status-text">Idle</span>
+        </div>
+        <div class="path-info" id="path-info"></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <section id="view-benchmarks" class="view active">
+        <div class="view-head">
+          <div>
+            <h1>Benchmarks</h1>
+            <p>Compare suites, random runs, and scenario accuracy.</p>
+          </div>
+          <div class="controls">
+            <button class="btn" id="refresh-benchmarks">Refresh</button>
+          </div>
+        </div>
+        <div class="split">
+          <div class="panel list" id="benchmarks-list"></div>
+          <div class="panel detail" id="benchmark-detail">
+            <div class="empty">Select a benchmark to inspect.</div>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-builder" class="view">
+        <div class="view-head">
+          <div>
+            <h1>System Builder</h1>
+            <p>Wire nodes, edit prompts, and save back to YAML.</p>
+          </div>
+          <div class="controls">
+            <select class="input" id="system-select"></select>
+            <button class="btn" id="system-load">Load</button>
+            <button class="btn" id="system-new">New</button>
+            <button class="btn primary" id="system-save">Save</button>
+            <button class="btn" id="system-save-as">Save As</button>
+          </div>
+        </div>
+        <div class="builder">
+          <div class="panel graph">
+            <div class="graph-toolbar">
+              <button class="btn" id="add-node">Add Node</button>
+              <select class="input" id="edge-type">
+                <option value="on_success">on_success</option>
+                <option value="on_failure">on_failure</option>
+                <option value="on_loop_exhausted">on_loop_exhausted</option>
+              </select>
+              <button class="btn" id="connect-mode">Connect</button>
+              <button class="btn" id="delete-selected">Delete</button>
+              <button class="btn" id="toggle-yaml">YAML</button>
+            </div>
+            <div id="graph" class="graph-canvas"></div>
+          </div>
+          <div class="panel inspector">
+            <div id="inspector" class="inspector-content">
+              <div class="empty">Load a system to start editing.</div>
+            </div>
+            <div id="yaml-editor" class="yaml-editor hidden">
+              <textarea id="yaml-textarea" spellcheck="false"></textarea>
+              <div class="yaml-actions">
+                <button class="btn primary" id="yaml-apply">Apply YAML</button>
+                <button class="btn" id="yaml-close">Close</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/vis-network/standalone/umd/vis-network.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

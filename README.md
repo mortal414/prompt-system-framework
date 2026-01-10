@@ -19,6 +19,7 @@ export OPENAI_API_KEY=sk-...
 - Run: `psf run --system systems/chess_move_system.yaml --input <input.json>`
 - Replay: `psf replay --run runs/<system_id>/<run_id>/run.json`
 - Benchmark (labeled scenarios): `psf benchmark --system <sys.yaml> --inputs-dir <dir> --iterations 5 --expect-field expected_legality --output-field is_legal`
+- UI: `psf ui` (launches the local UI server)
 
 Artifacts contract: `docs/runs-and-artifacts.md`.
 

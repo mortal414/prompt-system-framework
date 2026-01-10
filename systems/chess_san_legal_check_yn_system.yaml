@@ -2,7 +2,6 @@ id: "chess_san_legal_check_yn_system"
 label: "Chess SAN Legal Check (Y/N)"
 version: "0.1.0"
 entry_node_id: "ask_legality_yn"
-benchmark_batch_size: 100
 
 system_input:
   fields:

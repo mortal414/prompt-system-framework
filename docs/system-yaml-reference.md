@@ -27,7 +27,6 @@ Optional:
 
 - `label` (string)
 - `version` (string)
-- `benchmark_batch_size` (int, default `1`): Used by `psf benchmark` and OpenAI Batch integration.
 - `system_input` (object, default `{fields: {}}`): Declares expected inputs.
 
 ## `system_input`
