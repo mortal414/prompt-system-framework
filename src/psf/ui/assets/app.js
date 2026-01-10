@@ -343,6 +343,15 @@ function initGraph() {
     setStatus("Edge created", "idle");
   });
 
+  network.on("click", (params) => {
+    if (state.connecting) {
+      return;
+    }
+    if (!params.nodes.length && !params.edges.length) {
+      showSystemInspector();
+    }
+  });
+
   network.on("dragEnd", () => {
     if (!state.systemPath) return;
     const positions = network.getPositions();
@@ -447,6 +456,10 @@ function renderInspector() {
     els.inspector.innerHTML = '<div class="empty">Load a system to start editing.</div>';
     return;
   }
+  const systemButton = document.getElementById("show-system");
+  if (systemButton) {
+    systemButton.classList.toggle("active", !state.selectedNodeId && !state.selectedEdgeId);
+  }
   if (state.selectedEdgeId) {
     const edge = state.graph.edges.get(state.selectedEdgeId);
     renderEdgeInspector(edge);
@@ -458,6 +471,15 @@ function renderInspector() {
     return;
   }
   renderSystemInspector();
+}
+
+function showSystemInspector() {
+  state.selectedNodeId = null;
+  state.selectedEdgeId = null;
+  if (state.graph?.network) {
+    state.graph.network.unselectAll();
+  }
+  renderInspector();
 }
 
 function renderSystemInspector() {
@@ -731,6 +753,8 @@ function renderNodeInspector(node) {
   }
   const isSystemNode = Boolean(node.use_system);
   const bindings = Object.entries(node.input_bindings || {});
+  const outputSchemaText = node.output_schema ? JSON.stringify(node.output_schema, null, 2) : "";
+  const outputMode = node.output_mode || "raw";
 
   const bindingRows = bindings
     .map(
@@ -754,7 +778,7 @@ function renderNodeInspector(node) {
 
   els.inspector.innerHTML = `
     <div class="inspector-section">
-      <h3>Node</h3>
+      <h3>Node Details</h3>
       <div class="row">
         <div class="field"><label>ID</label><input id="node-id" value="${escapeHtml(node.id)}" /></div>
         <div class="field"><label>Label</label><input id="node-label" value="${escapeHtml(node.label || "")}" /></div>
@@ -776,12 +800,31 @@ function renderNodeInspector(node) {
       <div class="field"><label>Max Retries</label><input id="node-retries" type="number" value="${node.max_retries || 0}" /></div>
     </div>
     <div class="inspector-section">
-      <h3>Inputs</h3>
+      <h3>Node Inputs</h3>
       <div class="table">${bindingRows || '<div class="empty">No bindings.</div>'}</div>
       <button class="btn" id="add-binding">Add Binding</button>
     </div>
+    <div class="inspector-section" id="node-system" style="${isSystemNode ? "" : "display:none"}">
+      <h3>System Node</h3>
+      <div class="field"><label>use_system Path</label><input id="node-use-system" value="${escapeHtml(node.use_system || "")}" /></div>
+      <div class="meta">Output uses the subsystem final_output mapping.</div>
+    </div>
+    <div class="inspector-section" id="node-prompt" style="${isSystemNode ? "display:none" : ""}">
+      <h3>Prompt</h3>
+      <div class="field"><label>Instructions</label><textarea id="node-instructions">${escapeHtml(node.instructions || "")}</textarea></div>
+      <div class="field"><label>Prompt Template</label><textarea id="node-prompt-template">${escapeHtml(node.prompt_template || "")}</textarea></div>
+    </div>
+    <div class="inspector-section" id="node-output" style="${isSystemNode ? "display:none" : ""}">
+      <h3>Output</h3>
+      <div class="field"><label>Output Mode</label>
+        <select id="node-output-mode">
+          ${["raw", "structured", "both"].map((mode) => `<option value="${mode}" ${outputMode === mode ? "selected" : ""}>${mode}</option>`).join("")}
+        </select>
+      </div>
+      <div class="field"><label>Output Schema (JSON)</label><textarea id="node-output-schema">${escapeHtml(outputSchemaText)}</textarea></div>
+    </div>
     <div class="inspector-section" id="node-llm" style="${isSystemNode ? "display:none" : ""}">
-      <h3>LLM Settings</h3>
+      <h3>Model</h3>
       <div class="row">
         <div class="field"><label>Provider</label><input id="node-provider" value="${escapeHtml(node.provider || "openai")}" /></div>
         <div class="field"><label>Model</label><input id="node-model" value="${escapeHtml(node.model || "")}" /></div>
@@ -790,18 +833,6 @@ function renderNodeInspector(node) {
         <div class="field"><label>Temperature</label><input id="node-temp" type="number" step="0.1" value="${node.temperature ?? ""}" /></div>
         <div class="field"><label>Max Tokens</label><input id="node-max" type="number" value="${node.max_tokens ?? ""}" /></div>
       </div>
-      <div class="field"><label>Instructions</label><textarea id="node-instructions">${escapeHtml(node.instructions || "")}</textarea></div>
-      <div class="field"><label>Prompt Template</label><textarea id="node-prompt">${escapeHtml(node.prompt_template || "")}</textarea></div>
-      <div class="field"><label>Output Mode</label>
-        <select id="node-output-mode">
-          ${["raw", "structured", "both"].map((mode) => `<option value="${mode}" ${node.output_mode === mode ? "selected" : ""}>${mode}</option>`).join("")}
-        </select>
-      </div>
-      <div class="field"><label>Output Schema (JSON)</label><textarea id="node-output-schema">${escapeHtml(prettyJSON(node.output_schema))}</textarea></div>
-    </div>
-    <div class="inspector-section" id="node-system" style="${isSystemNode ? "" : "display:none"}">
-      <h3>System Node</h3>
-      <div class="field"><label>use_system Path</label><input id="node-use-system" value="${escapeHtml(node.use_system || "")}" /></div>
     </div>
     <div class="inspector-section">
       <h3>Loop Control</h3>
@@ -859,7 +890,7 @@ function renderNodeInspector(node) {
     document.getElementById("node-instructions").addEventListener("input", (e) => {
       node.instructions = e.target.value;
     });
-    document.getElementById("node-prompt").addEventListener("input", (e) => {
+    document.getElementById("node-prompt-template").addEventListener("input", (e) => {
       node.prompt_template = e.target.value;
     });
     document.getElementById("node-output-mode").addEventListener("change", (e) => {
@@ -1223,6 +1254,8 @@ function bindControls() {
     e.target.classList.toggle("active", state.connecting);
     setStatus(state.connecting ? "Select source node" : "Connect mode off", "busy");
   });
+
+  document.getElementById("show-system").addEventListener("click", showSystemInspector);
 
   document.getElementById("delete-selected").addEventListener("click", deleteSelected);
 
