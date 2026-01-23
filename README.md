@@ -10,6 +10,12 @@ pip install -e .
 export OPENAI_API_KEY=sk-...
 ```
 
+For chess datasets/utilities:
+
+```bash
+pip install -e ".[chess]"
+```
+
 ## CLI (stable surface)
 
 - Validate: `psf validate --system systems/chess_move_system.yaml`
@@ -18,7 +24,7 @@ export OPENAI_API_KEY=sk-...
 - Export resolved graph: `psf graph --system systems/chess_move_system.yaml --out graph.json`
 - Run: `psf run --system systems/chess_move_system.yaml --input <input.json>`
 - Replay: `psf replay --run runs/<system_id>/<run_id>/run.json`
-- Benchmark (labeled scenarios): `psf benchmark --system <sys.yaml> --inputs-dir <dir> --iterations 5 --expect-field expected_legality --output-field is_legal`
+- Benchmark (scenario suites): `psf benchmark --system <sys.yaml> --inputs-dir <dir> --iterations 5`
 - UI: `psf ui` (launches the local UI server)
 
 Artifacts contract: `docs/runs-and-artifacts.md`.
@@ -26,9 +32,10 @@ Artifacts contract: `docs/runs-and-artifacts.md`.
 ## Canonical config + docs
 
 - System YAML reference (matches Pydantic models): `docs/system-yaml-reference.md`
+- Benchmarking format + runner: `docs/benchmarking.md`
 - Composition via `use_system`: `docs/composition.md`
 - Primer / motivation: `Prompt-System.md`
-- Chess example benchmarks and scripts: `docs/chess-benchmarks.md`
+- Chess guide (data generation + benchmarking): `docs/chess.md`
 
 ## Repository layout
 

@@ -20,6 +20,8 @@ system_input:
 
 system_output:
   fields:
+    answer:
+      from: "node.final_response.output.move_san"
     move_san:
       from: "node.final_response.output.move_san"
     trusted_by_validator:

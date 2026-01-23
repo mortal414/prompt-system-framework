@@ -24,6 +24,8 @@ system_input:
 
 system_output:
   fields:
+    answer:
+      from: "node.generate_move.output.move_san"
     move_san:
       from: "node.generate_move.output.move_san"
 

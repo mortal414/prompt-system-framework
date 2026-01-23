@@ -15,7 +15,7 @@ from typing import Any, Callable, Optional
 
 import chess
 
-from psf.chess_utils import GeneratedPosition, generate_illegal_san, generate_illegal_uci, play_random_plies
+from chess_data import GeneratedPosition, generate_illegal_san, generate_illegal_uci, play_random_plies
 from psf.config_loader import load_system_definition
 from psf.engine import (
     ContextStore,

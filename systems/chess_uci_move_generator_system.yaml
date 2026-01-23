@@ -24,6 +24,8 @@ system_input:
 
 system_output:
   fields:
+    answer:
+      from: "node.generate_move.output.move_uci"
     move_uci:
       from: "node.generate_move.output.move_uci"
 

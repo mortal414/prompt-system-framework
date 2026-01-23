@@ -28,6 +28,8 @@ system_input:
 
 system_output:
   fields:
+    answer:
+      from: "node.parse_legality_yn.output.is_legal"
     is_legal:
       from: "node.parse_legality_yn.output.is_legal"
     verdict:

@@ -33,12 +33,10 @@ _FALSE_LABELS = {"illegal", "false", "f", "0", "no", "n"}
 class BenchmarkScenario:
     name: str
     path: Path
-    payload: dict[str, Any]
-    expected_bool: bool
-
-    @property
-    def expected_label(self) -> str:
-        return "legal" if self.expected_bool else "illegal"
+    input_payload: dict[str, Any]
+    match_mode: str
+    expected_value: Any
+    expected_label: str
 
 
 @dataclass
@@ -203,8 +201,21 @@ def benchmark(
     input: Optional[List[str]] = typer.Option(None, "--input", "-i", help="Specific input file (repeatable)"),
     iterations: int = typer.Option(5, "--iterations", min=1, help="Number of runs per scenario"),
     batch_size: int = typer.Option(1, "--batch-size", min=1, help="Requests per OpenAI batch job (OpenAI only)"),
-    expect_field: str = typer.Option("expected_legality", "--expect-field", help="Input field containing the expected legality label"),
-    output_field: str = typer.Option("is_legal", "--output-field", help="System output field to compare"),
+    expect_field: str = typer.Option(
+        "expected",
+        "--expect-field",
+        help="Scenario field containing the expected answer/label (supports dot paths like expected.value)",
+    ),
+    output_field: str = typer.Option(
+        "answer",
+        "--output-field",
+        help="System output field to score (supports dot paths like answer.value)",
+    ),
+    match_mode: str = typer.Option(
+        "auto",
+        "--match",
+        help="Scoring mode: exact | one_of | auto (bool is legacy)",
+    ),
     run_dir: str = typer.Option(DEFAULT_RUN_DIR, "--run-dir", help="Directory to store per-iteration artifacts"),
 ) -> None:
     """Run multiple labeled inputs repeatedly across one or more systems and report accuracy statistics."""
@@ -213,7 +224,7 @@ def benchmark(
     scenario_paths = _collect_scenario_paths(inputs_dir, input)
     if not scenario_paths:
         raise typer.BadParameter("No benchmark inputs provided. Use --inputs-dir and/or --input.")
-    scenarios = _load_benchmark_scenarios(scenario_paths, expect_field)
+    scenarios = _load_benchmark_scenarios(scenario_paths, expect_field, match_mode=match_mode)
     run_root = Path(run_dir).expanduser().resolve()
     run_root.mkdir(parents=True, exist_ok=True)
     benchmark_id = _generate_benchmark_id()
@@ -235,6 +246,7 @@ def benchmark(
                 iterations=iterations,
                 batch_size=batch_size,
                 output_field=output_field,
+                match_mode=match_mode,
                 suite_root=suite_root,
                 benchmark_id=benchmark_id,
                 expect_field=expect_field,
@@ -252,6 +264,7 @@ def benchmark(
         system_summaries=system_summaries,
         expect_field=expect_field,
         output_field=output_field,
+        match_mode=match_mode,
         iterations_per_scenario=iterations,
     )
     _print_system_comparison_table(system_summaries, suite_summary_path)
@@ -360,6 +373,7 @@ def _print_execution_result(result: ExecutionResult, run_dir: Path) -> None:
 def _collect_scenario_paths(inputs_dir: Optional[str], explicit_inputs: Optional[List[str]]) -> list[Path]:
     paths: list[Path] = []
     seen: set[Path] = set()
+    skip_names = {"manifest.json", "manifest.yaml", "manifest.yml"}
 
     def _record(path: Path) -> None:
         if path in seen:
@@ -374,6 +388,8 @@ def _collect_scenario_paths(inputs_dir: Optional[str], explicit_inputs: Optional
         for pattern in ("*.json", "*.yaml", "*.yml"):
             for candidate in sorted(directory.glob(pattern)):
                 if candidate.is_file():
+                    if candidate.name.lower() in skip_names:
+                        continue
                     _record(candidate.resolve())
 
     if explicit_inputs:
@@ -383,6 +399,8 @@ def _collect_scenario_paths(inputs_dir: Optional[str], explicit_inputs: Optional
                 for pattern in ("*.json", "*.yaml", "*.yml"):
                     for candidate in sorted(path.glob(pattern)):
                         if candidate.is_file():
+                            if candidate.name.lower() in skip_names:
+                                continue
                             _record(candidate.resolve())
             elif path.is_file():
                 _record(path.resolve())
@@ -392,24 +410,122 @@ def _collect_scenario_paths(inputs_dir: Optional[str], explicit_inputs: Optional
     return paths
 
 
-def _load_benchmark_scenarios(paths: list[Path], expect_field: str) -> list[BenchmarkScenario]:
+def _normalize_match_mode(mode: str) -> str:
+    normalized = mode.strip().lower()
+    if normalized not in {"bool", "exact", "one_of", "auto"}:
+        raise typer.BadParameter("--match must be one of: bool, exact, one_of, auto")
+    return normalized
+
+
+def _short_value(value: Any, *, max_chars: int = 64) -> str:
+    if isinstance(value, str):
+        rendered = value.strip()
+    else:
+        try:
+            rendered = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            rendered = str(value)
+    rendered = rendered.replace("\n", "\\n")
+    if len(rendered) > max_chars:
+        return rendered[: max_chars - 3] + "..."
+    return rendered
+
+
+def _normalize_answer(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return ("true" if value else "false").strip()
+    if isinstance(value, str):
+        return value.strip()
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True).strip()
+    except TypeError:
+        return str(value).strip()
+
+
+_MISSING = object()
+
+
+def _get_by_path(container: Any, path: str) -> Any:
+    current = container
+    for part in path.split("."):
+        if not part:
+            return _MISSING
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+            continue
+        return _MISSING
+    return current
+
+
+def _infer_scenario_expectation(value: Any, *, match_mode: str, path: Path) -> tuple[str, Any, str]:
+    mode = _normalize_match_mode(match_mode)
+    if mode == "auto":
+        mode = "one_of" if isinstance(value, list) else "exact"
+
+    if mode == "bool":
+        try:
+            expected_bool = _coerce_bool(value)
+        except ValueError as exc:
+            raise typer.BadParameter(f"{path}: {exc}") from exc
+        return mode, expected_bool, ("true" if expected_bool else "false")
+
+    if mode == "one_of":
+        if not isinstance(value, list):
+            raise typer.BadParameter(f"{path}: expected '{match_mode}' values to be a list for --match one_of")
+        if not value:
+            raise typer.BadParameter(f"{path}: expected list for '{path}' must not be empty")
+        normalized = [_normalize_answer(item) for item in value]
+        return mode, normalized, "one_of"
+
+    normalized = _normalize_answer(value)
+    return "exact", normalized, _short_value(normalized)
+
+
+def _load_benchmark_scenarios(
+    paths: list[Path],
+    expect_field: str,
+    *,
+    match_mode: str,
+) -> list[BenchmarkScenario]:
     scenarios: list[BenchmarkScenario] = []
     for path in paths:
         data = _read_structured_file(path)
         if not isinstance(data, dict):
             raise typer.BadParameter(f"Benchmark input must be an object: {path}")
-        if expect_field not in data:
+        expected = _get_by_path(data, expect_field)
+        if expected is _MISSING:
             raise typer.BadParameter(f"Missing '{expect_field}' in {path}")
-        try:
-            expected_bool = _coerce_bool(data[expect_field])
-        except ValueError as exc:
-            raise typer.BadParameter(f"{path}: {exc}") from exc
+
+        input_payload: dict[str, Any]
+        if "input" in data:
+            raw_input = data.get("input")
+            if not isinstance(raw_input, dict):
+                raise typer.BadParameter(f"{path}: 'input' must be an object")
+            input_payload = raw_input
+        else:
+            input_payload = dict(data)
+            input_payload.pop("input", None)
+            input_payload.pop("expected", None)
+            input_payload.pop("meta", None)
+            input_payload.pop("id", None)
+            if "." not in expect_field:
+                input_payload.pop(expect_field, None)
+
+        scenario_mode, expected_value, expected_label = _infer_scenario_expectation(
+            expected,
+            match_mode=match_mode,
+            path=path,
+        )
         scenarios.append(
             BenchmarkScenario(
                 name=path.stem,
                 path=path,
-                payload=data,
-                expected_bool=expected_bool,
+                input_payload=input_payload,
+                match_mode=scenario_mode,
+                expected_value=expected_value,
+                expected_label=expected_label,
             )
         )
     return scenarios
@@ -423,6 +539,7 @@ def _run_benchmark_for_system(
     iterations: int,
     batch_size: int,
     output_field: str,
+    match_mode: str,
     suite_root: Path,
     benchmark_id: str,
     expect_field: str,
@@ -442,12 +559,11 @@ def _run_benchmark_for_system(
         return get_provider(name)
 
     iteration_results: dict[str, list[BenchmarkIterationRecord]] = defaultdict(list)
-    scenario_expected_map = {s.name: s.expected_label for s in scenarios}
     successes: dict[str, int] = defaultdict(int)
     futures = []
 
     def _execute_iteration(scenario: BenchmarkScenario, iteration_index: int) -> tuple[str, BenchmarkIterationRecord]:
-        payload = copy.deepcopy(scenario.payload)
+        payload = copy.deepcopy(scenario.input_payload)
         scenario_slug = _sanitize_name(scenario.name)
         run_id = f"{benchmark_id}-{scenario_slug}-{iteration_index:03d}"
         run_logger = RunLogger(benchmark_root, system_def, run_id=run_id, use_system_subdir=False)
@@ -478,24 +594,51 @@ def _run_benchmark_for_system(
             detail = result.error or "run failed without final output"
         else:
             final_output = result.final_output
-            if output_field not in final_output:
+            actual_raw = _get_by_path(final_output, output_field)
+            if actual_raw is _MISSING:
                 iteration_status = "missing_output"
                 actual_label = "missing"
                 detail = f"final output missing '{output_field}'"
             else:
-                try:
-                    actual_bool = _coerce_bool(final_output[output_field])
-                    actual_label = "legal" if actual_bool else "illegal"
-                except ValueError as exc:
-                    iteration_status = "invalid_output"
-                    actual_label = "invalid"
-                    detail = str(exc)
+                if scenario.match_mode == "bool":
+                    try:
+                        actual_bool = _coerce_bool(actual_raw)
+                    except ValueError as exc:
+                        iteration_status = "invalid_output"
+                        actual_label = "invalid"
+                        detail = str(exc)
+                    else:
+                        actual_label = "true" if actual_bool else "false"
+                        expected_bool = bool(scenario.expected_value)
+                        if actual_bool == expected_bool:
+                            detail = final_output.get("reason")
+                        else:
+                            iteration_status = "mismatch"
+                            detail = final_output.get("reason") or "mismatched label"
+                elif scenario.match_mode == "one_of":
+                    if not isinstance(scenario.expected_value, list):
+                        iteration_status = "invalid_expected"
+                        actual_label = "invalid_expected"
+                        detail = "scenario expected_value is not a list"
+                    else:
+                        actual_value = _normalize_answer(actual_raw)
+                        actual_label = _short_value(actual_value, max_chars=48)
+                        expected_values = [_normalize_answer(item) for item in scenario.expected_value]
+                        if actual_value in expected_values:
+                            detail = final_output.get("reason")
+                        else:
+                            iteration_status = "mismatch"
+                            sample = ", ".join(_short_value(v, max_chars=12) for v in expected_values[:5])
+                            detail = f"value not in expected list (n={len(expected_values)}; sample={sample})"
                 else:
-                    if actual_bool == scenario.expected_bool:
+                    expected_value = _normalize_answer(scenario.expected_value)
+                    actual_value = _normalize_answer(actual_raw)
+                    actual_label = _short_value(actual_value, max_chars=48)
+                    if actual_value == expected_value:
                         detail = final_output.get("reason")
                     else:
                         iteration_status = "mismatch"
-                        detail = final_output.get("reason") or "mismatched legality"
+                        detail = f"expected {_short_value(expected_value)} got {_short_value(actual_value)}"
         return scenario.name, BenchmarkIterationRecord(
             iteration=iteration_index,
             run_dir=str(run_logger.run_dir),
@@ -514,9 +657,7 @@ def _run_benchmark_for_system(
             scenario_name, record = future.result()
             iteration_results[scenario_name].append(record)
             if record.status == "success":
-                scenario_expected = scenario_expected_map.get(scenario_name)
-                if scenario_expected and record.actual_label == scenario_expected:
-                    successes[scenario_name] += 1
+                successes[scenario_name] += 1
 
     scenario_results: list[BenchmarkResult] = []
     for scenario in scenarios:
@@ -541,6 +682,7 @@ def _run_benchmark_for_system(
         finished_at=finished_at,
         expect_field=expect_field,
         output_field=output_field,
+        match_mode=match_mode,
         iterations_per_scenario=iterations,
     )
     return SystemBenchmarkSummary(
@@ -574,7 +716,7 @@ def _print_benchmark_summary(results: list[BenchmarkResult], summary_path: Optio
         )
     failures = [res for res in results if res.failures]
     if not failures:
-        typer.secho("\nAll scenarios matched the expected legality labels.", fg=typer.colors.GREEN)
+        typer.secho("\nAll scenarios matched the expected outputs.", fg=typer.colors.GREEN)
     else:
         typer.secho(f"\n{len(failures)} scenario(s) had mismatches:", fg=typer.colors.YELLOW)
         for result in failures:
@@ -669,6 +811,7 @@ def _write_benchmark_summary(
     finished_at: datetime,
     expect_field: str,
     output_field: str,
+    match_mode: str,
     iterations_per_scenario: int,
 ) -> None:
     summary: dict[str, Any] = {
@@ -681,6 +824,7 @@ def _write_benchmark_summary(
         "finished_at": finished_at.isoformat(),
         "expect_field": expect_field,
         "output_field": output_field,
+        "match_mode": match_mode,
         "iterations_per_scenario": iterations_per_scenario,
         "scenario_count": len(results),
         "scenarios": [],
@@ -719,6 +863,7 @@ def _write_suite_summary(
     system_summaries: List[SystemBenchmarkSummary],
     expect_field: str,
     output_field: str,
+    match_mode: str,
     iterations_per_scenario: int,
 ) -> None:
     data: dict[str, Any] = {
@@ -727,6 +872,7 @@ def _write_suite_summary(
         "system_count": len(system_summaries),
         "expect_field": expect_field,
         "output_field": output_field,
+        "match_mode": match_mode,
         "iterations_per_scenario": iterations_per_scenario,
         "systems": [],
         "scenarios": [],

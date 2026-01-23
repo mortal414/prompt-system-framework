@@ -28,6 +28,8 @@ system_input:
 
 system_output:
   fields:
+    answer:
+      from: "node.parse_legality_result.output.move_uci"
     move_uci:
       from: "node.parse_legality_result.output.move_uci"
     is_legal:

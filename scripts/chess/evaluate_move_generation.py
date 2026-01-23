@@ -42,6 +42,14 @@ def _read_json(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"{path} must be a JSON object")
+    if "input" in data:
+        payload = data.get("input")
+        if not isinstance(payload, dict):
+            raise ValueError(f"{path}: 'input' must be a JSON object")
+        return payload
+    data.pop("expected", None)
+    data.pop("meta", None)
+    data.pop("id", None)
     return data
 
 
