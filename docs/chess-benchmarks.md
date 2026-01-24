@@ -1,4 +1,3 @@
 # Chess Benchmarks
 
-Chess documentation moved to `docs/chess.md`.
-
+Chess documentation moved to [chess.md](chess.md).

@@ -4,10 +4,22 @@ Config-first framework for running **systems of prompts**: typed graphs of LLM-p
 
 ## Quickstart
 
+macOS/Linux:
+
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e .
 export OPENAI_API_KEY=sk-...
+```
+
+Windows (PowerShell):
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -e .
+$env:OPENAI_API_KEY="sk-..."
 ```
 
 For chess datasets/utilities:
@@ -29,13 +41,16 @@ pip install -e ".[chess]"
 
 Artifacts contract: `docs/runs-and-artifacts.md`.
 
-## Canonical config + docs
+## Docs
 
-- System YAML reference (matches Pydantic models): `docs/system-yaml-reference.md`
-- Benchmarking format + runner: `docs/benchmarking.md`
-- Composition via `use_system`: `docs/composition.md`
-- Primer / motivation: `Prompt-System.md`
-- Chess guide (data generation + benchmarking): `docs/chess.md`
+Start here: [docs/README.md](docs/README.md).
+Browse: [docs/](docs/).
+
+- System YAML reference (matches Pydantic models): [docs/system-yaml-reference.md](docs/system-yaml-reference.md)
+- Benchmarking format + runner: [docs/benchmarking.md](docs/benchmarking.md)
+- Composition via `use_system`: [docs/composition.md](docs/composition.md)
+- Primer / motivation: [Prompt-System.md](Prompt-System.md)
+- Chess guide (data generation + benchmarking): [docs/chess.md](docs/chess.md)
 
 ## Repository layout
 

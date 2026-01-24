@@ -44,7 +44,7 @@ Top-level run summary, including:
 - `run_id`
 - `status` (`success` or `failure`) and `error`
 - `started_at`, `finished_at`
-- `final_output` (the system’s returned payload when successful)
+- `final_output` (the system's returned payload when successful)
 - `metrics` (token totals, per-node totals, `models_used`)
 - `artifacts` (paths to the files above)
 - `source_config` (when invoked via CLI with a source `--system` path)

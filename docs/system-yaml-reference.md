@@ -2,7 +2,7 @@
 
 This is the stable config surface area for PSF. The canonical schema is defined by the Pydantic models:
 
-- `src/psf/models.py` (`SystemDef`, `NodeDef`, `InputBinding`, …)
+- `src/psf/models.py` (`SystemDef`, `NodeDef`, `InputBinding`, ...)
 
 Machine-readable JSON schema:
 
@@ -146,7 +146,7 @@ Each list contains rules:
 
 Conditions are a small expression language (Python-like) evaluated with:
 
-- `output`: the node’s parsed structured output (dict-like), or `{}` when none
+- `output`: the node's parsed structured output (dict-like), or `{}` when none
 - `context`: full execution context (`system`, `node`, `runtime`)
 - literals: `true`, `false`, `null`
 
@@ -181,9 +181,9 @@ Loop counters are stored under `runtime.loop_counters.<counter_key>`.
     candidate_move: {from: "node.propose_move.output.move_uci"}
 ```
 
-System nodes execute the referenced system and expose the subsystem’s `final_output` under:
+System nodes execute the referenced system and expose the subsystem's `final_output` under:
 
 - `node.<id>.output`
 - `output` (for routing conditions in that node)
 
-See `docs/composition.md`.
+See [composition.md](composition.md).

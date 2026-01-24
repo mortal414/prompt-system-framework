@@ -2,7 +2,7 @@
 
 PSF itself is chess-agnostic. Chess support in this repo is provided as a standalone dataset generator plus a few example systems under `systems/`.
 
-Benchmark scenario format is documented in `docs/benchmarking.md`.
+Benchmark scenario format is documented in [benchmarking.md](benchmarking.md).
 
 ## Install chess extras
 
@@ -58,11 +58,13 @@ UCI:
 python chess_data.py --task move_generation_uci --out-dir examples/input/chess/move_generation_uci --count 200 --plies 8 --seed 1 --overwrite
 ```
 
-To test “validated/retry” generators that must avoid prior attempts, you can pre-populate `illegal_moves`:
+To test "validated/retry" generators that must avoid prior attempts, you can pre-populate `illegal_moves`:
 
 ```bash
 python chess_data.py --task move_generation_uci --out-dir examples/input/chess/move_generation_uci_forbidden --count 200 --plies 8 --seed 1 --forbidden-moves-per-scenario 3 --overwrite
 ```
+
+Generated datasets include a `manifest.json` for convenience; `psf benchmark` ignores it when scanning scenario directories.
 
 ## Benchmark with PSF
 
@@ -81,6 +83,8 @@ psf benchmark --system systems/chess_san_legal_check_yn_system.yaml --system sys
 ```
 
 Artifacts are written under `runs/benchmarks/<benchmark_id>/` (see `suite_summary.json`).
+
+For large runs, add `--batch-size N` to submit model calls via the OpenAI Batch API (OpenAI provider only).
 
 UCI:
 

@@ -5,11 +5,11 @@ PSF supports **system nodes**: a node can execute another complete system define
 ## How it works (contract)
 
 - A node with `use_system: <path>` loads the referenced system and executes it as a **subsystem**.
-- The node’s `input_bindings` become the subsystem’s `system_input` payload.
-- The node’s output is the subsystem’s `final_output` (built from the subsystem’s `system_output` mappings).
+- The node's `input_bindings` become the subsystem's `system_input` payload.
+- The node's output is the subsystem's `final_output` (built from the subsystem's `system_output` mappings).
 - In the parent system, the subsystem output is available as:
   - `node.<system_node_id>.output.<field>` (in bindings and system_output mappings)
-  - `output.<field>` (inside that node’s routing conditions)
+  - `output.<field>` (inside that node's routing conditions)
 
 ## Constraints (validated)
 

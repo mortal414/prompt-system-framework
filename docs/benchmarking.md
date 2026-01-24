@@ -18,6 +18,15 @@ Each scenario is a JSON/YAML file with:
 - `expected` is used only for scoring (it is not passed to the system).
 - `meta` is optional and ignored by the runner.
 
+## Scenario discovery
+
+`psf benchmark` loads scenarios from either:
+
+- `--inputs-dir <dir>`: reads `*.json`, `*.yaml`, `*.yml` in that directory (non-recursive)
+- `--input <path>` (repeatable): each path may be a file or a directory
+
+Files named `manifest.json`, `manifest.yaml`, or `manifest.yml` are ignored when scanning directories.
+
 ### What systems should output
 
 By default, benchmarks score `final_output.answer` against `scenario.expected`. If your system uses a different output field, override it with `--output-field`.
@@ -57,6 +66,14 @@ psf benchmark \
   --output-field answer.value
 ```
 
+## Batching (OpenAI)
+
+For large suites, you can enable OpenAI Batch API submission with `--batch-size N` (when using the OpenAI provider):
+
+```bash
+psf benchmark --system systems/my_system.yaml --inputs-dir examples/input/my_task --iterations 5 --batch-size 50
+```
+
 ## Artifacts
 
 Benchmarks are written under `runs/benchmarks/<benchmark_id>/`:
@@ -64,3 +81,5 @@ Benchmarks are written under `runs/benchmarks/<benchmark_id>/`:
 - `suite_summary.json`: cross-system comparison table + metadata
 - `<system_id>/benchmark_summary.json`: per-scenario results for one system
 - `<system_id>/<run_id>/...`: standard PSF per-run artifacts (`system.yaml`, `input.json`, `nodes.jsonl`, `run.json`)
+
+See [runs-and-artifacts.md](runs-and-artifacts.md) for the full artifact contract.
