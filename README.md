@@ -1,6 +1,8 @@
 # Prompt System Framework (PSF)
 
-Config-first framework for running **systems of prompts**: typed graphs of LLM-powered nodes with explicit inputs, structured outputs, routing, and loops. Systems are authored as YAML/JSON and executed by a small engine that produces stable run artifacts under `runs/`.
+A personal experiment in running **systems of prompts**: typed graphs of LLM-powered nodes with explicit inputs, structured outputs, routing, and loops. Systems are authored as YAML/JSON and executed by a small engine that produces stable run artifacts under `runs/`.
+
+**Status:** I made this for fun and learning. I'm not currently using or developing it.
 
 ## Quickstart
 
@@ -28,7 +30,7 @@ For chess datasets/utilities:
 pip install -e ".[chess]"
 ```
 
-## CLI (stable surface)
+## CLI
 
 - Validate: `psf validate --system systems/chess_move_system.yaml`
 - Inspect: `psf inspect --system systems/chess_move_system.yaml`
@@ -43,8 +45,7 @@ Artifacts contract: `docs/runs-and-artifacts.md`.
 
 ## Docs
 
-Start here: [docs/README.md](docs/README.md).
-Browse: [docs/](docs/).
+Browse the [documentation](docs/), or start with the [system YAML reference](docs/system-yaml-reference.md).
 
 - System YAML reference (matches Pydantic models): [docs/system-yaml-reference.md](docs/system-yaml-reference.md)
 - Benchmarking format + runner: [docs/benchmarking.md](docs/benchmarking.md)
@@ -55,10 +56,10 @@ Browse: [docs/](docs/).
 ## Repository layout
 
 ```
-src/psf/          # Engine + schema + CLI (product)
-systems/          # Curated example systems (safe defaults)
-systems/_scratch/ # Experiments / variants (not part of the stable surface)
-experiments/      # Notebooks / one-offs (not part of the stable surface)
-scripts/          # Example utilities (not part of the stable surface)
+src/psf/          # Engine + schema + CLI
+systems/          # Example prompt systems
+systems/_scratch/ # Experiments / variants (experimental)
+experiments/      # Notebooks / one-offs (experimental)
+scripts/          # Example utilities (experimental)
 docs/             # Contract + guides
 ```
